@@ -1,109 +1,660 @@
-Your Phase 4 results showed one real problem, and I've fixed it. The first segment after every start had 1–2 short gaps of dropped frames. Everything else passed: every other segment had exactly 900 frames at 15.00 fps with 0.0 s missing between files. The crash recovery and camera-busy retries also worked exactly as intended.
+Phase 5 (storage management) is ready for you to run on the Pi. I tested it here with the same fake camera setup as before, but it hasn't run on your Pi yet.
 
-## What caused the gaps
+## What it does
 
-Picamera2 only loads its video-file library (PyAV) the first time it creates an MP4 file. In my recorder, that happens inside the encoder thread on the very first frame, which stalls it. The camera drops frames when the encoder stalls. In Phase 3 the library was loaded before recording started, which is why Phase 3 had no gaps. Loading it takes about 46 ms on this fast machine; on a Pi 4 reading from an SD card it's likely several hundred milliseconds, which is enough to drop 4–7 frames.
+The storage manager checks every 30 seconds and again whenever a segment finishes.
 
-I reproduced it here with a simulated camera that drops frames the way real hardware does:
+- **Size limit.** While recordings take more than `max_storage_gb` (default 45 GB), it deletes the oldest finished segment. The segment currently being written (`.partial`) is never deleted, but its size does count towards the limit.
+- **Free-space safety.** While free space is below `min_free_gb` (default 2 GB), it also deletes oldest first. If nothing is left to delete, it logs a "Storage low" warning and keeps recording.
+- **Emergency pause.** If free space falls below half of `min_free_gb` (1 GB), writing pauses at the next keyframe. The camera keeps running, and writing resumes by itself once free space is back above 60 % (1.2 GB). The gap between the two thresholds stops it switching on and off repeatedly.
+- **Optional age limit.** `max_age_days` deletes anything older (0 = off).
+- **SSD guard for later.** `required_mount` (e.g. `/mnt/cctv`) makes the recorder refuse to record if that drive isn't mounted, instead of silently filling the SD card.
+- **Crash and power-cut recovery.** A leftover `.partial` that has been untouched for more than 60 seconds is cut back to its last complete 2-second fragment, checked with `ffprobe`, and renamed `….recovered.mp4`. If nothing playable remains, it is deleted.
+- **Logs.** Every deletion is logged, and a usage summary is logged every 10 minutes.
 
-| Version | First segment | Other segments | Aligned segments start at |
-|---|---|---|---|
-| Old | FAIL: 1 gap at 0.0 s (+400 ms) | PASS | about 1–2 s after the boundary |
-| New | PASS, no gaps | PASS (900 frames each) | `14:34:00.048`, about 50 ms after |
+Everything is based on what's on disk; the SQLite index comes in Phase 7.
 
-## What changed in version 0.4.1
+## What I tested
 
-1. **The library is loaded before the camera starts.** This is the fix for the gaps.
-2. **A keyframe is requested exactly at each boundary.** Before, every aligned segment waited for the next regular keyframe; yours consistently started about 1.9 s late (`14:06:01.957`, `14:07:01.942`…). Now a `…-05-00Z.mp4` file really starts at about :00.1. That will matter when motion events are matched to recordings.
-3. **libcamera's verbose INFO lines are hidden.** Only its warnings and errors appear now.
-4. **The checker shows where each gap is,** for example `1 timestamp gap(s) at 0.0 s (+400 ms)`.
-5. **Minor:** a doubled full stop is removed from the camera-busy error message, and stopping is safer if startup fails halfway.
+- **Deletion order:** oldest first, with the segment being written protected. Empty folders from earlier days were removed.
+- **Recovery:** I cut a real fragmented recording at 70 % to simulate a power cut. Recovery removed the 61 KiB half-written tail, leaving 8.0 s that decodes with no errors. **Chrome showed the correct 8.00 s length and seeked within it.** A junk `.partial` was deleted.
+- **End to end with the fake camera** (0.02 GB limit, 60 s segments): a crashed `.partial` was recovered before the camera started, deletions kept usage at or below the limit, and the file being written was never touched.
+- **Free-space states:** with a 2 GB minimum, simulated free space of 10 → 1.5 → 0.9 → 1.1 → 1.3 → 2.5 GB gave `ok → low → critical (paused) → still paused → low (resumed) → ok`.
+- **Pause and resume inside the recorder:** writing paused at the first keyframe after storage became critical, and resumed at the first keyframe after it recovered, in a new file.
+- **Unmounted SSD path:** the recorder refused to start, retried with increasing waits, and created no folder on the SD card.
+- **Invalid settings** were rejected: a recordings folder outside `required_mount`, text where a number belongs, and negative sizes.
 
-## Update these five files
+## Files
 
-Paste each block into the terminal from `~/surveillance`. Each one replaces the whole file. `config.py`, `fileutil.py`, `clock.py` and `logging_setup.py` are unchanged.
+| File | Status |
+|---|---|
+| `app/__init__.py` | Version 0.5.0 |
+| `app/config.py` | New `storage` section |
+| `app/storage_manager.py` | **New** |
+| `app/recorder.py` | Pause and resume, refuses an unmounted drive, reports which file is being written |
+| `app/main.py` | Starts the storage manager and runs recovery before the camera starts |
+| `tools/phase5_storage_report.py` | **New.** Read-only report: usage, limits, bitrate, hours of history, what would be deleted |
+| `tools/set_setting.py` | **New.** Change one setting safely (validated, atomic save) |
+
+`fileutil.py`, `clock.py`, `camera.py`, `logging_setup.py` and `phase4_check_segments.py` are unchanged. Paste each block below from `~/surveillance`.
 
 ```bash
 cat > ~/surveillance/app/__init__.py <<'EOF'
 """Raspberry Pi surveillance camera."""
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 EOF
 ```
 
 ```bash
-cat > ~/surveillance/app/camera.py <<'EOF'
-"""Picamera2 wrapper: opens and configures the camera with a main + lores stream."""
+cat > ~/surveillance/app/config.py <<'EOF'
+"""Typed, validated settings stored as JSON.
+
+Every value is checked for type and range when loaded, so a typo or an out-of-range
+value stops the service with a clear message instead of misbehaving later.
+"""
 from __future__ import annotations
 
-import logging
+import json
+import re
+from dataclasses import asdict, dataclass, field, fields
+from pathlib import Path
+from typing import Any
 
-from app.config import CameraSettings
+from app.fileutil import atomic_write_bytes
 
-log = logging.getLogger("Camera")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "settings.json"
+
+ALLOWED_SEGMENT_SECONDS = (60, 120, 300, 600, 900, 1800, 3600)
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+LOG_FORMATS = ("text", "json")
+RETENTION_MODES = ("oldest_first",)
+MAX_ENCODER_PIXELS = 1920 * 1080
+CAMERA_NAME_PATTERN = re.compile(r"^[\w][\w .,'()-]{0,39}$")
 
 
-class CameraError(RuntimeError):
+class ConfigError(ValueError):
     pass
 
 
-class Camera:
-    def __init__(self, settings: CameraSettings) -> None:
-        self.settings = settings
-        self.picam2 = None
+@dataclass(frozen=True)
+class CameraSettings:
+    camera_num: int = 0
+    name: str = "Camera 1"
+    width: int = 1296
+    height: int = 972
+    lores_width: int = 640
+    lores_height: int = 480
+    framerate: float = 15.0
+    bitrate: int = 2_500_000
+    keyframe_seconds: float = 2.0
+    rotate180: bool = False
 
-    def open(self) -> None:
-        try:
-            from libcamera import Transform
-            from picamera2 import Picamera2
-        except ImportError as exc:
-            raise CameraError(f"Picamera2 is not installed ({exc})") from exc
+    def validate(self) -> None:
+        _check_range("camera.camera_num", self.camera_num, 0, 3)
+        if not CAMERA_NAME_PATTERN.match(self.name):
+            raise ConfigError("camera.name must be 1-40 letters, digits, spaces or . , ' ( ) - _")
+        _check_range("camera.width", self.width, 64, 1920)
+        _check_range("camera.height", self.height, 64, 1920)
+        if self.width % 16 or self.height % 2:
+            raise ConfigError("camera.width must be a multiple of 16 and camera.height must be even")
+        if self.width * self.height > MAX_ENCODER_PIXELS:
+            raise ConfigError("camera.width x camera.height exceeds the 1920x1080 hardware encoder limit")
+        _check_range("camera.lores_width", self.lores_width, 160, self.width)
+        _check_range("camera.lores_height", self.lores_height, 120, self.height)
+        if self.lores_width % 16 or self.lores_height % 2:
+            raise ConfigError("camera.lores_width must be a multiple of 16 and lores_height even")
+        _check_range("camera.framerate", self.framerate, 1.0, 30.0)
+        _check_range("camera.bitrate", self.bitrate, 250_000, 10_000_000)
+        _check_range("camera.keyframe_seconds", self.keyframe_seconds, 0.5, 10.0)
 
-        s = self.settings
-        cameras = Picamera2.global_camera_info()
-        if s.camera_num >= len(cameras):
-            raise CameraError(f"camera {s.camera_num} not detected ({len(cameras)} camera(s) found)")
-        try:
-            self.picam2 = Picamera2(s.camera_num)
-        except (RuntimeError, IndexError) as exc:
-            reason = str(exc).rstrip(".")
-            raise CameraError(f"cannot open camera {s.camera_num} (in use by another program?): {reason}") from exc
+    @property
+    def keyframe_interval_frames(self) -> int:
+        return max(1, round(self.keyframe_seconds * self.framerate))
 
-        try:
-            size = (s.width, s.height)
-            sensor_size = self._matching_sensor_size(size)
-            config = self.picam2.create_video_configuration(
-                main={"size": size, "format": "YUV420"},
-                lores={"size": (s.lores_width, s.lores_height), "format": "YUV420"},
-                sensor={"output_size": sensor_size} if sensor_size else {},
-                controls={"FrameRate": s.framerate},
-                transform=Transform(hflip=s.rotate180, vflip=s.rotate180),
-            )
-            self.picam2.configure(config)
-        except Exception as exc:
-            self.close()
-            raise CameraError(f"cannot configure camera: {exc}") from exc
 
-        model = self.picam2.camera_properties.get("Model", "unknown")
-        log.info("Opened %s: main %dx%d, lores %dx%d, %g fps, sensor mode %s", model, s.width, s.height,
-                 s.lores_width, s.lores_height, s.framerate,
-                 f"{sensor_size[0]}x{sensor_size[1]}" if sensor_size else "auto")
+@dataclass(frozen=True)
+class RecordingSettings:
+    segment_seconds: int = 300
 
-    def _matching_sensor_size(self, size: tuple[int, int]) -> tuple[int, int] | None:
-        """Use the sensor mode with exactly the recording size (e.g. OV5647 1296x972 full view)."""
-        for mode in self.picam2.sensor_modes:
-            if tuple(mode["size"]) == size:
-                return size
+    def validate(self) -> None:
+        if self.segment_seconds not in ALLOWED_SEGMENT_SECONDS:
+            allowed = ", ".join(str(value) for value in ALLOWED_SEGMENT_SECONDS)
+            raise ConfigError(f"recording.segment_seconds must be one of: {allowed}")
+
+
+@dataclass(frozen=True)
+class StorageSettings:
+    max_storage_gb: float = 45.0
+    min_free_gb: float = 2.0
+    max_age_days: int = 0
+    retention: str = "oldest_first"
+    required_mount: str = ""
+
+    def validate(self) -> None:
+        _check_range("storage.max_storage_gb", self.max_storage_gb, 0.01, 100_000)
+        _check_range("storage.min_free_gb", self.min_free_gb, 0.1, 10_000)
+        _check_range("storage.max_age_days", self.max_age_days, 0, 3650)
+        if self.retention not in RETENTION_MODES:
+            raise ConfigError(f"storage.retention must be one of: {', '.join(RETENTION_MODES)}")
+        if self.required_mount and not Path(self.required_mount).is_absolute():
+            raise ConfigError("storage.required_mount must be empty or an absolute path such as /mnt/cctv")
+
+
+@dataclass(frozen=True)
+class PathSettings:
+    recordings_dir: str = "recordings"
+    log_dir: str = "logs"
+
+    def validate(self) -> None:
+        for name in ("recordings_dir", "log_dir"):
+            value = getattr(self, name)
+            if not value.strip() or "\x00" in value:
+                raise ConfigError(f"paths.{name} must be a non-empty path")
+
+
+@dataclass(frozen=True)
+class LoggingSettings:
+    level: str = "INFO"
+    format: str = "text"
+    console: bool = True
+    max_bytes: int = 5_000_000
+    backup_count: int = 5
+
+    def validate(self) -> None:
+        if self.level not in LOG_LEVELS:
+            raise ConfigError(f"logging.level must be one of: {', '.join(LOG_LEVELS)}")
+        if self.format not in LOG_FORMATS:
+            raise ConfigError(f"logging.format must be one of: {', '.join(LOG_FORMATS)}")
+        _check_range("logging.max_bytes", self.max_bytes, 100_000, 50_000_000)
+        _check_range("logging.backup_count", self.backup_count, 1, 20)
+
+
+@dataclass(frozen=True)
+class Settings:
+    camera: CameraSettings = field(default_factory=CameraSettings)
+    recording: RecordingSettings = field(default_factory=RecordingSettings)
+    storage: StorageSettings = field(default_factory=StorageSettings)
+    paths: PathSettings = field(default_factory=PathSettings)
+    logging: LoggingSettings = field(default_factory=LoggingSettings)
+
+    def validate(self) -> None:
+        for section in fields(self):
+            getattr(self, section.name).validate()
+        mount = self.storage.required_mount
+        if mount and not self.recordings_dir.is_relative_to(Path(mount)):
+            raise ConfigError(f"paths.recordings_dir ({self.recordings_dir}) must be inside "
+                              f"storage.required_mount ({mount})")
+
+    @property
+    def recordings_dir(self) -> Path:
+        return resolve_path(self.paths.recordings_dir)
+
+    @property
+    def log_dir(self) -> Path:
+        return resolve_path(self.paths.log_dir)
+
+
+def resolve_path(value: str) -> Path:
+    """Relative paths are relative to the project directory, so the app works from any cwd."""
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _check_range(name: str, value: float, low: float, high: float) -> None:
+    if not low <= value <= high:
+        raise ConfigError(f"{name} must be between {low:g} and {high:g} (got {value!r})")
+
+
+def _coerce(value: Any, expected: type, name: str) -> Any:
+    if expected is bool:
+        if isinstance(value, bool):
+            return value
+    elif expected is int:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    elif expected is float:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    elif expected is str:
+        if isinstance(value, str):
+            return value
+    raise ConfigError(f"{name} must be of type {expected.__name__} (got {value!r})")
+
+
+def _build_section(cls: type, data: Any, section: str) -> Any:
+    if not isinstance(data, dict):
+        raise ConfigError(f"'{section}' must be a JSON object")
+    known = {f.name for f in fields(cls)}
+    unknown = sorted(set(data) - known)
+    if unknown:
+        raise ConfigError(f"unknown setting(s) in '{section}': {', '.join(unknown)}")
+    defaults = cls()
+    values = {}
+    for f in fields(cls):
+        default = getattr(defaults, f.name)
+        values[f.name] = (_coerce(data[f.name], type(default), f"{section}.{f.name}")
+                          if f.name in data else default)
+    return cls(**values)
+
+
+def settings_from_dict(data: Any) -> Settings:
+    if not isinstance(data, dict):
+        raise ConfigError("settings file must contain a JSON object")
+    section_types = {f.name: type(getattr(Settings(), f.name)) for f in fields(Settings)}
+    unknown = sorted(set(data) - set(section_types))
+    if unknown:
+        raise ConfigError(f"unknown section(s): {', '.join(unknown)}")
+    settings = Settings(**{name: _build_section(cls, data.get(name, {}), name)
+                           for name, cls in section_types.items()})
+    settings.validate()
+    return settings
+
+
+def load_settings(path: Path = DEFAULT_CONFIG_PATH, create_if_missing: bool = True) -> tuple[Settings, bool]:
+    """Return (settings, created). A missing file is created with defaults if allowed."""
+    if not path.exists():
+        if not create_if_missing:
+            raise ConfigError(f"{path} does not exist")
+        settings = Settings()
+        save_settings(settings, path)
+        return settings, True
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"{path}: invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}") from None
+    except OSError as exc:
+        raise ConfigError(f"cannot read {path}: {exc.strerror}") from None
+    return settings_from_dict(data), False
+
+
+def save_settings(settings: Settings, path: Path = DEFAULT_CONFIG_PATH) -> None:
+    settings.validate()
+    text = json.dumps(asdict(settings), indent=2) + "\n"
+    atomic_write_bytes(path, text.encode("utf-8"))
+EOF
+```
+
+```bash
+cat > ~/surveillance/app/storage_manager.py <<'EOF'
+"""Storage quota, free-space safety and crash recovery for recording segments.
+
+Rules:
+  * Only completed segments (*.mp4) are ever deleted, oldest first. The segment being
+    written (*.mp4.partial) is never touched.
+  * Delete while usage > max_storage_gb, or free space < min_free_gb, or a segment is older
+    than max_age_days (if set).
+  * If free space falls below half of min_free_gb with nothing left to delete, writing pauses
+    (the camera keeps running) and resumes automatically once space is available again.
+  * Unfinished .partial files left by a crash or power cut are trimmed to their last complete
+    fragment and renamed *.recovered.mp4, or deleted if nothing playable remains.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import struct
+import subprocess
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
+
+from app.config import Settings
+from app.fileutil import fsync_directory
+
+log = logging.getLogger("StorageManager")
+
+GB = 1_000_000_000
+CHECK_INTERVAL_S = 30.0
+USAGE_LOG_INTERVAL_S = 600.0
+PARTIAL_STALE_S = 60.0
+MIN_PLAYABLE_S = 1.0
+CRITICAL_FRACTION = 0.5
+RESUME_FRACTION = 0.6
+MAX_INDIVIDUAL_DELETE_LOGS = 5
+
+SEGMENT_SUFFIX = ".mp4"
+PARTIAL_SUFFIX = ".mp4.partial"
+RECOVERED_SUFFIX = ".recovered.mp4"
+
+
+@dataclass(frozen=True)
+class SegmentFile:
+    path: Path
+    rel_path: str
+    size: int          # bytes actually allocated on disk
+    start: float       # UTC epoch seconds, from the file name (mtime as fallback)
+    mtime: float
+    partial: bool
+
+
+@dataclass(frozen=True)
+class StorageStatus:
+    state: str         # ok | low | critical | unavailable
+    message: str
+    used_bytes: int
+    free_bytes: int
+    total_bytes: int
+    max_bytes: int
+    min_free_bytes: int
+    segment_count: int
+    oldest_start: float | None
+    newest_start: float | None
+
+
+def parse_segment_start(day: str, name: str) -> float | None:
+    """'2026-09-23', '14-05-00Z.mp4' -> UTC epoch seconds."""
+    stem = name.split("Z", 1)[0]
+    try:
+        return datetime.strptime(f"{day} {stem}", "%Y-%m-%d %H-%M-%S").replace(
+            tzinfo=timezone.utc).timestamp()
+    except ValueError:
         return None
 
-    def close(self) -> None:
-        if self.picam2 is None:
-            return
+
+def scan_segments(root: Path) -> list[SegmentFile]:
+    """All segment and partial files under root, oldest first."""
+    found: list[SegmentFile] = []
+    try:
+        days = [entry for entry in os.scandir(root) if entry.is_dir(follow_symlinks=False)]
+    except FileNotFoundError:
+        return found
+    for day in days:
         try:
-            self.picam2.close()
-        except Exception as exc:  # noqa: BLE001 - closing must never raise
-            log.debug("Error while closing camera: %s", exc)
-        self.picam2 = None
+            entries = list(os.scandir(day.path))
+        except OSError as exc:
+            log.error("Cannot read %s: %s", day.path, exc.strerror)
+            continue
+        for entry in entries:
+            name = entry.name
+            partial = name.endswith(PARTIAL_SUFFIX)
+            if not (partial or name.endswith(SEGMENT_SUFFIX)) or name.startswith("."):
+                continue
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            start = parse_segment_start(day.name, name)
+            found.append(SegmentFile(path=Path(entry.path), rel_path=f"{day.name}/{name}",
+                                     size=st.st_blocks * 512, start=start if start is not None else st.st_mtime,
+                                     mtime=st.st_mtime, partial=partial))
+    found.sort(key=lambda f: (f.start, f.rel_path))
+    return found
+
+
+def plan_deletions(files: list[SegmentFile], *, now: float, max_bytes: int, min_free_bytes: int,
+                   free_bytes: int, max_age_days: int, protected: set[Path]) -> list[tuple[SegmentFile, str]]:
+    """Pure decision function: which completed segments to delete (oldest first) and why."""
+    usage = sum(f.size for f in files)
+    cutoff = now - max_age_days * 86400 if max_age_days else None
+    plan = []
+    for f in files:
+        if f.partial or f.path in protected:
+            continue
+        if cutoff is not None and f.start < cutoff:
+            reason = f"older than {max_age_days} day(s)"
+        elif usage > max_bytes:
+            reason = f"over the {max_bytes / GB:g} GB limit"
+        elif free_bytes < min_free_bytes:
+            reason = f"free space below {min_free_bytes / GB:g} GB"
+        else:
+            break
+        plan.append((f, reason))
+        usage -= f.size
+        free_bytes += f.size
+    return plan
+
+
+def trim_to_complete_fragments(path: Path) -> tuple[int, int]:
+    """Cut a fragmented MP4 after its last complete fragment. Returns (old_size, new_size).
+
+    A power cut leaves a half-written moof/mdat box at the end; removing it makes the
+    file well-formed so browsers play it to the end instead of stalling.
+    """
+    with open(path, "r+b") as handle:
+        size = os.fstat(handle.fileno()).st_size
+        pos = last_good = 0
+        pending_moof = False
+        while pos + 8 <= size:
+            handle.seek(pos)
+            header = handle.read(16)
+            box_size, box_type = struct.unpack(">I4s", header[:8])
+            if box_size == 1:
+                if len(header) < 16:
+                    break
+                box_size = struct.unpack(">Q", header[8:16])[0]
+            elif box_size == 0:
+                box_size = size - pos
+            if box_size < 8 or pos + box_size > size:
+                break
+            pos += box_size
+            if box_type == b"moof":
+                pending_moof = True
+            elif box_type == b"mdat":
+                pending_moof = False
+                last_good = pos
+            elif not pending_moof:
+                last_good = pos
+        if last_good < size:
+            handle.truncate(last_good)
+            handle.flush()
+            os.fsync(handle.fileno())
+    return size, last_good
+
+
+def playable_seconds(path: Path) -> float | None:
+    """Seconds of decodable video according to ffprobe, or None if ffprobe is unavailable."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=120, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    times = []
+    for line in result.stdout.splitlines():
+        try:
+            times.append(float(line.strip().rstrip(",")))
+        except ValueError:
+            continue
+    return max(times) - min(times) if len(times) > 1 else 0.0
+
+
+class StorageManager:
+    def __init__(self, settings: Settings, current_segment: Callable[[], Path | None]) -> None:
+        s = settings.storage
+        self.root = settings.recordings_dir
+        self._required_mount = Path(s.required_mount) if s.required_mount else None
+        self._max_bytes = int(s.max_storage_gb * GB)
+        self._min_free_bytes = int(s.min_free_gb * GB)
+        self._max_age_days = s.max_age_days
+        self._current_segment = current_segment
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="storage-manager", daemon=True)
+        self._writable = True
+        self._last_usage_log = 0.0
+        self._warned_capacity = False
+        self._ffprobe_warned = False
+        self.status: StorageStatus | None = None
+
+    def location_error(self) -> str | None:
+        """Why recordings must not be written right now (e.g. the SSD is not mounted), or None."""
+        if self._required_mount is not None and not os.path.ismount(self._required_mount):
+            return f"{self._required_mount} is not mounted; refusing to record onto the SD card"
+        return None
+
+    def can_write(self) -> bool:
+        return self._writable
+
+    def trigger(self) -> None:
+        self._wake.set()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=30)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._wake.wait(CHECK_INTERVAL_S)
+            self._wake.clear()
+            if self._stop.is_set():
+                return
+            try:
+                self.run_cycle()
+            except Exception:  # noqa: BLE001 - never let the storage thread die
+                log.exception("Storage check failed")
+
+    def run_cycle(self) -> StorageStatus:
+        with self._lock:
+            problem = self.location_error()
+            if problem:
+                return self._set_status("unavailable", problem, [], 0, 0)
+            self.root.mkdir(parents=True, exist_ok=True)
+            current = self._current_segment()
+            files = scan_segments(self.root)
+            if self._recover_partials(files, current):
+                files = scan_segments(self.root)
+
+            disk = shutil.disk_usage(self.root)
+            protected = {current} if current else set()
+            plan = plan_deletions(files, now=time.time(), max_bytes=self._max_bytes,
+                                  min_free_bytes=self._min_free_bytes, free_bytes=disk.free,
+                                  max_age_days=self._max_age_days, protected=protected)
+            if plan:
+                self._delete(plan)
+                files = scan_segments(self.root)
+                disk = shutil.disk_usage(self.root)
+            return self._evaluate(files, disk)
+
+    def _evaluate(self, files: list[SegmentFile], disk) -> StorageStatus:
+        used = sum(f.size for f in files)
+        if not self._warned_capacity and self._max_bytes > used + disk.free - self._min_free_bytes:
+            self._warned_capacity = True
+            log.warning("Maximum storage %.1f GB does not fit on this disk while keeping %.1f GB free "
+                        "(room for about %.1f GB); the free-space limit will apply first",
+                        self._max_bytes / GB, self._min_free_bytes / GB,
+                        max(0, used + disk.free - self._min_free_bytes) / GB)
+
+        critical_below = self._min_free_bytes * CRITICAL_FRACTION
+        resume_above = self._min_free_bytes * RESUME_FRACTION
+        if disk.free < critical_below or (not self._writable and disk.free < resume_above):
+            state = "critical"
+            message = (f"only {disk.free / GB:.2f} GB free and nothing left to delete; "
+                       f"recording is PAUSED until more space is available")
+        elif disk.free < self._min_free_bytes:
+            state = "low"
+            message = (f"only {disk.free / GB:.2f} GB free (minimum {self._min_free_bytes / GB:g} GB); "
+                       f"something other than recordings is filling the disk")
+        elif used > self._max_bytes:
+            state = "low"
+            message = f"recordings use {used / GB:.2f} GB, above the {self._max_bytes / GB:g} GB limit"
+        else:
+            state = "ok"
+            message = "ok"
+        return self._set_status(state, message, files, used, disk.free, disk.total)
+
+    def _set_status(self, state: str, message: str, files: list[SegmentFile], used: int, free: int,
+                    total: int = 0) -> StorageStatus:
+        previous = self.status.state if self.status else None
+        if state != previous:
+            if state == "ok":
+                if previous is not None:
+                    log.info("Storage back to normal")
+            elif state == "low":
+                log.warning("Storage low: %s", message)
+            else:
+                log.error("Storage %s: %s", state, message)
+        self._writable = state in ("ok", "low")
+
+        complete = [f for f in files if not f.partial]
+        self.status = StorageStatus(
+            state=state, message=message, used_bytes=used, free_bytes=free, total_bytes=total,
+            max_bytes=self._max_bytes, min_free_bytes=self._min_free_bytes, segment_count=len(complete),
+            oldest_start=complete[0].start if complete else None,
+            newest_start=complete[-1].start if complete else None)
+
+        now = time.monotonic()
+        if state != "unavailable" and now - self._last_usage_log >= USAGE_LOG_INTERVAL_S:
+            self._last_usage_log = now
+            oldest = (datetime.fromtimestamp(self.status.oldest_start, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                      if self.status.oldest_start else "none")
+            log.info("Storage usage %.2f GB / %g GB, %.1f GB free, %d segments, oldest %s",
+                     used / GB, self._max_bytes / GB, free / GB, len(complete), oldest)
+        return self.status
+
+    def _delete(self, plan: list[tuple[SegmentFile, str]]) -> None:
+        freed = 0
+        deleted = 0
+        touched_days: set[Path] = set()
+        for f, reason in plan:
+            try:
+                f.path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                log.error("Cannot delete %s: %s", f.rel_path, exc.strerror)
+                continue
+            deleted += 1
+            freed += f.size
+            touched_days.add(f.path.parent)
+            if deleted <= MAX_INDIVIDUAL_DELETE_LOGS:
+                log.info("Deleted %s (%.1f MB): %s", f.rel_path, f.size / 1e6, reason)
+        if deleted > MAX_INDIVIDUAL_DELETE_LOGS:
+            log.info("Deleted %d segments in total, freeing %.1f GB", deleted, freed / GB)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        for day in touched_days:
+            if day.name < today:
+                try:
+                    day.rmdir()
+                except OSError:
+                    pass
+        if touched_days:
+            fsync_directory(self.root)
+
+    def _recover_partials(self, files: list[SegmentFile], current: Path | None) -> bool:
+        changed = False
+        now = time.time()
+        for f in files:
+            if not f.partial or f.path == current or now - f.mtime < PARTIAL_STALE_S:
+                continue
+            changed |= self._recover(f)
+        return changed
+
+    def _recover(self, f: SegmentFile) -> bool:
+        try:
+            old_size, new_size = trim_to_complete_fragments(f.path)
+        except OSError as exc:
+            log.error("Cannot read unfinished segment %s: %s", f.rel_path, exc.strerror)
+            return False
+        seconds = playable_seconds(f.path) if new_size else 0.0
+        if seconds is None:
+            if not self._ffprobe_warned:
+                self._ffprobe_warned = True
+                log.error("ffprobe is not available; cannot check unfinished segments (sudo apt install ffmpeg)")
+            return False
+        if seconds < MIN_PLAYABLE_S:
+            f.path.unlink(missing_ok=True)
+            log.warning("Deleted unfinished segment %s: nothing playable (%.1f MB)", f.rel_path, old_size / 1e6)
+            return True
+        recovered = f.path.with_name(f.path.name[: -len(PARTIAL_SUFFIX)] + RECOVERED_SUFFIX)
+        os.replace(f.path, recovered)
+        fsync_directory(recovered.parent)
+        trimmed = old_size - new_size
+        log.warning("Recovered unfinished segment %s -> %s: %.1f s playable%s", f.rel_path, recovered.name,
+                    seconds, f", removed {trimmed / 1024:.0f} KiB of incomplete data" if trimmed else "")
+        return True
 EOF
 ```
 
@@ -185,8 +736,10 @@ class SegmentingOutput(Output):
 
     def __init__(self, recordings_dir: Path, segment_seconds: int, framerate: float,
                  keyframe_seconds: float, clock: ClockMonitor,
-                 on_closed: Callable[[_OpenSegment], None]) -> None:
+                 on_closed: Callable[[_OpenSegment], None], can_write: Callable[[], bool]) -> None:
         super().__init__()
+        self._can_write = can_write
+        self.paused = False
         self.needs_add_stream = True
         self._streams: list[tuple] = []
         self._dir = recordings_dir
@@ -209,6 +762,11 @@ class SegmentingOutput(Output):
         seg = self._current
         return str(seg.final_path.relative_to(self._dir)) if seg else None
 
+    @property
+    def current_partial_path(self) -> Path | None:
+        seg = self._current
+        return seg.partial_path if seg else None
+
     def _add_stream(self, encoder_stream, codec_name, **kwargs) -> None:
         self._streams.append((encoder_stream, codec_name, kwargs))
 
@@ -227,6 +785,15 @@ class SegmentingOutput(Output):
             if timestamp is None:
                 timestamp = int(self.last_frame_monotonic * 1_000_000)
             seg = self._current
+            if keyframe and not self._can_write():
+                if not self.paused:
+                    log.error("Recording paused: storage is critically full")
+                    self.paused = True
+                self._close_current()
+                return
+            if keyframe and self.paused:
+                log.info("Recording resumed: storage space is available again")
+                self.paused = False
             if keyframe and self._should_rotate(seg, timestamp):
                 self._close_current()
                 seg = self._open(timestamp)
@@ -315,10 +882,14 @@ class SegmentingOutput(Output):
 class Recorder:
     """Owns the camera, the hardware H.264 encoder and the segment files."""
 
-    def __init__(self, settings: Settings, clock: ClockMonitor) -> None:
+    def __init__(self, settings: Settings, clock: ClockMonitor,
+                 can_write: Callable[[], bool] = lambda: True,
+                 location_error: Callable[[], str | None] = lambda: None) -> None:
         self.settings = settings
         self.recordings_dir = settings.recordings_dir
         self._clock = clock
+        self._can_write = can_write
+        self._location_error = location_error
         self._camera: Camera | None = None
         self._output: SegmentingOutput | None = None
         self._recording = False
@@ -337,8 +908,15 @@ class Recorder:
     def current_segment(self) -> str | None:
         return self._output.current_rel_path if self._output else None
 
+    @property
+    def current_partial_path(self) -> Path | None:
+        return self._output.current_partial_path if self._output else None
+
     def start(self) -> None:
         cam = self.settings.camera
+        problem = self._location_error()
+        if problem:
+            raise OSError(problem)
         self.recordings_dir.mkdir(parents=True, exist_ok=True)
         if not os.access(self.recordings_dir, os.W_OK):
             raise PermissionError(f"recordings directory is not writable: {self.recordings_dir}")
@@ -350,7 +928,7 @@ class Recorder:
                               framerate=cam.framerate, profile="high", repeat=True)
         self._output = SegmentingOutput(self.recordings_dir, self.settings.recording.segment_seconds,
                                         cam.framerate, cam.keyframe_seconds, self._clock,
-                                        self._finalize_queue.put)
+                                        self._finalize_queue.put, self._can_write)
         self._camera.picam2.start_recording(encoder, self._output)
         self._recording = True
         self._started_monotonic = time.monotonic()
@@ -484,13 +1062,13 @@ from app.clock import ClockMonitor  # noqa: E402
 from app.config import DEFAULT_CONFIG_PATH, ConfigError, Settings, load_settings  # noqa: E402
 from app.logging_setup import setup_logging  # noqa: E402
 from app.recorder import Recorder  # noqa: E402
+from app.storage_manager import StorageManager  # noqa: E402
 
 log = logging.getLogger("Main")
 
 BACKOFF_INITIAL_S = 5
 BACKOFF_MAX_S = 60
 HEALTHY_RESET_S = 120
-PARTIAL_GLOB = "*/*.mp4.partial"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -501,21 +1079,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def report_leftover_partials(settings: Settings) -> None:
-    leftovers = sorted(settings.recordings_dir.glob(PARTIAL_GLOB))
-    if leftovers:
-        log.warning("%d unfinished segment(s) from a previous run (crash or power cut), newest: %s. "
-                    "They are kept for recovery.", len(leftovers), leftovers[-1].name)
-
-
 def run(settings: Settings, stop: threading.Event) -> None:
     clock = ClockMonitor()
     clock.start()
-    report_leftover_partials(settings)
+    active: list[Recorder] = []
+    storage = StorageManager(settings, lambda: active[0].current_partial_path if active else None)
+    # Recover unfinished segments and free space before the camera starts writing.
+    try:
+        storage.run_cycle()
+    except Exception:  # noqa: BLE001 - the periodic check retries; recording matters more
+        log.exception("Initial storage check failed")
+    storage.start()
     backoff = BACKOFF_INITIAL_S
     try:
         while not stop.is_set():
-            recorder = Recorder(settings, clock)
+            recorder = Recorder(settings, clock, storage.can_write, storage.location_error)
+            recorder.add_listener(lambda _segment: storage.trigger())
+            active[:] = [recorder]
             try:
                 recorder.start()
             except (CameraError, OSError) as exc:
@@ -538,6 +1118,8 @@ def run(settings: Settings, stop: threading.Event) -> None:
                 stop.wait(backoff)
                 backoff = min(backoff * 2, BACKOFF_MAX_S)
     finally:
+        active.clear()
+        storage.stop()
         clock.stop()
 
 
@@ -578,158 +1160,120 @@ EOF
 ```
 
 ```bash
-cat > ~/surveillance/tools/phase4_check_segments.py <<'EOF'
+cat > ~/surveillance/tools/phase5_storage_report.py <<'EOF'
 #!/usr/bin/env python3
-"""Phase 4: verify the segmented recordings written by the recorder.
+"""Phase 5: read-only storage report. Changes nothing on disk.
 
-Run from anywhere (while the recorder runs, or after stopping it):
+    python3 ~/surveillance/tools/phase5_storage_report.py [--max-gb N] [--min-free-gb N]
 
-    python3 ~/surveillance/tools/phase4_check_segments.py [--date YYYY-MM-DD] [--last N]
-
-For every completed segment it checks: starts on a keyframe, no internal timestamp gaps,
-frame rate, duration close to the configured segment length. It also checks that consecutive
-segments leave no missing time, and probes any leftover .partial files.
+Shows where recordings are stored, how much space they use, the configured limits, the
+average bitrate, how many hours of history the limit holds, and which segments the storage
+manager would delete right now (or with the limits given on the command line).
 """
 from __future__ import annotations
 
 import argparse
-import json
-import subprocess
+import os
+import shutil
 import sys
-from datetime import datetime, timedelta, timezone
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import DEFAULT_CONFIG_PATH, ConfigError, load_settings  # noqa: E402
+from app.storage_manager import (GB, RECOVERED_SUFFIX, plan_deletions,  # noqa: E402
+                                 scan_segments)
 
-CONTINUITY_TOLERANCE_S = 3.0
-
-
-def ffprobe_packets(path: Path) -> list[tuple[float, bool]]:
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", str(path)],
-        capture_output=True, text=True, timeout=300, check=False)
-    packets = []
-    for line in result.stdout.splitlines():
-        pts, _, flags = line.partition(",")
-        try:
-            packets.append((float(pts), "K" in flags))
-        except ValueError:
-            continue
-    return sorted(packets)
+BITRATE_SAMPLE_SEGMENTS = 12
 
 
-def ffprobe_size(path: Path) -> tuple[int | None, int | None]:
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height", "-of", "json", str(path)],
-        capture_output=True, text=True, timeout=60, check=False)
+def mount_point(path: Path) -> Path:
+    path = path.resolve()
+    while not os.path.ismount(path):
+        path = path.parent
+    return path
+
+
+def mount_device(mount: Path) -> str:
     try:
-        stream = json.loads(result.stdout or "{}").get("streams", [{}])[0]
-    except (json.JSONDecodeError, IndexError):
-        return None, None
-    return stream.get("width"), stream.get("height")
+        for line in Path("/proc/mounts").read_text().splitlines():
+            device, where, fstype, *_ = line.split()
+            if where == str(mount):
+                return f"{device} ({fstype})"
+    except OSError:
+        pass
+    return "unknown device"
 
 
-def nominal_start(path: Path) -> datetime | None:
-    """Recover the UTC start time encoded in <YYYY-MM-DD>/<HH-MM-SS>Z[-n].mp4."""
-    stem = path.name.split(".")[0].split("Z")[0]
-    try:
-        return datetime.strptime(f"{path.parent.name} {stem}", "%Y-%m-%d %H-%M-%S").replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
+def fmt_time(epoch: float | None) -> str:
+    if epoch is None:
+        return "none"
+    utc = datetime.fromtimestamp(epoch, timezone.utc)
+    local = utc.astimezone()
+    return f"{utc:%Y-%m-%d %H:%M} UTC ({local:%Y-%m-%d %H:%M} local)"
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Phase 4: check segmented recordings")
+    parser = argparse.ArgumentParser(description="Phase 5: storage report (read-only)")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--date", help="UTC day folder to check (default: newest)")
-    parser.add_argument("--last", type=int, default=0, help="only check the newest N segments")
+    parser.add_argument("--max-gb", type=float, help="simulate a different storage.max_storage_gb")
+    parser.add_argument("--min-free-gb", type=float, help="simulate a different storage.min_free_gb")
     args = parser.parse_args()
-
     try:
         settings, _ = load_settings(args.config, create_if_missing=False)
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
+
+    s = settings.storage
     root = settings.recordings_dir
+    max_gb = args.max_gb if args.max_gb is not None else s.max_storage_gb
+    min_free_gb = args.min_free_gb if args.min_free_gb is not None else s.min_free_gb
+    if not root.is_dir():
+        print(f"Recordings folder {root} does not exist yet.")
+        return 1
+
+    files = scan_segments(root)
+    complete = [f for f in files if not f.partial]
+    partials = [f for f in files if f.partial]
+    recovered = [f for f in complete if f.path.name.endswith(RECOVERED_SUFFIX)]
+    used = sum(f.size for f in files)
+    disk = shutil.disk_usage(root)
+    mount = mount_point(root)
     seg_len = settings.recording.segment_seconds
-    fps = settings.camera.framerate
-    size = (settings.camera.width, settings.camera.height)
 
-    days = sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
-    if not days:
-        print(f"No recordings found in {root}")
-        return 1
-    day = root / args.date if args.date else days[-1]
-    segments = sorted(day.glob("*.mp4"), key=lambda p: (nominal_start(p) or datetime.min, p.name))
-    partials = sorted(day.glob("*.mp4.partial"))
-    if args.last:
-        segments = segments[-args.last:]
-    print(f"Checking {len(segments)} segment(s) in {day} (segment length {seg_len} s, {fps:g} fps)\n")
+    print(f"Recordings folder : {root}")
+    print(f"Stored on         : {mount_device(mount)}, mounted at {mount}")
+    print(f"Disk              : {disk.total / GB:.1f} GB total, {disk.free / GB:.1f} GB free")
+    print(f"Limits            : max {max_gb:g} GB, keep {min_free_gb:g} GB free, max age "
+          f"{f'{s.max_age_days} days' if s.max_age_days else 'off'}, required mount "
+          f"{s.required_mount or 'none'}" + ("   (simulated)" if args.max_gb or args.min_free_gb else ""))
+    print(f"Recordings        : {used / GB:.2f} GB in {len(complete)} segments "
+          f"({len(recovered)} recovered, {len(partials)} unfinished)")
+    print(f"Oldest / newest   : {fmt_time(complete[0].start if complete else None)} / "
+          f"{fmt_time(complete[-1].start if complete else None)}")
 
-    failures = warnings = 0
-    checked = []
-    for path in segments:
-        packets = ffprobe_packets(path)
-        width, height = ffprobe_size(path)
-        if len(packets) < 2:
-            print(f"[FAIL] {path.name}: unreadable ({len(packets)} frames)")
-            failures += 1
-            continue
-        times = [t for t, _ in packets]
-        gaps = [(a - times[0], b - a) for a, b in zip(times, times[1:]) if b - a > 1.5 / fps]
-        duration = times[-1] - times[0] + 1 / fps
-        measured_fps = (len(times) - 1) / (times[-1] - times[0])
-        problems = []
-        if not packets[0][1]:
-            problems.append("does not start with a keyframe")
-        if gaps:
-            where = ", ".join(f"{at:.1f} s (+{step * 1000:.0f} ms)" for at, step in gaps[:3])
-            problems.append(f"{len(gaps)} timestamp gap(s) at {where}")
-        if (width, height) != size:
-            problems.append(f"resolution {width}x{height}")
-        if abs(measured_fps - fps) > 0.05 * fps:
-            problems.append(f"{measured_fps:.2f} fps")
-        status = "FAIL" if problems else "PASS"
-        failures += bool(problems)
-        mb = path.stat().st_size / 1e6
-        print(f"[{status}] {path.name}: {duration:6.1f} s, {len(packets)} frames, {measured_fps:.2f} fps, "
-              f"{mb:.1f} MB, {mb * 8 / duration:.2f} Mbit/s" + (f"  <- {', '.join(problems)}" if problems else ""))
-        checked.append((path, nominal_start(path), duration))
+    full = [f for f in complete if f.start % seg_len == 0 and not f.path.name.endswith(RECOVERED_SUFFIX)]
+    sample = full[-BITRATE_SAMPLE_SEGMENTS - 1:-1] or full[-BITRATE_SAMPLE_SEGMENTS:]
+    if sample:
+        bytes_per_s = sum(f.size for f in sample) / (len(sample) * seg_len)
+        capacity = min(max_gb * GB, used + disk.free - min_free_gb * GB)
+        hours = capacity / bytes_per_s / 3600 if bytes_per_s else 0
+        print(f"Average bitrate   : {bytes_per_s * 8 / 1e6:.2f} Mbit/s (last {len(sample)} full segments)")
+        print(f"Estimated history : {capacity / GB:.2f} GB usable = about {hours:.1f} h ({hours / 24:.1f} days)")
+    else:
+        print("Average bitrate   : not enough full-length segments yet")
 
-    print("\nContinuity (a new segment should start where the previous one ended):")
-    runs = 0
-    for (prev, prev_start, prev_dur), (cur, cur_start, _) in zip(checked, checked[1:]):
-        if prev_start is None or cur_start is None:
-            continue
-        missing = (cur_start - prev_start).total_seconds() - prev_dur
-        # The first segment after a (re)start is named after its real start time, not a boundary.
-        restarted = cur_start.timestamp() % seg_len != 0
-        if restarted:
-            print(f"  [INFO] {prev.name} -> {cur.name}: recorder stopped/restarted, "
-                  f"{timedelta(seconds=max(0, round(missing)))} not in completed segments")
-            runs += 1
-        elif abs(missing) <= CONTINUITY_TOLERANCE_S:
-            print(f"  [PASS] {prev.name} -> {cur.name}: {missing:+.1f} s")
-        else:
-            print(f"  [WARN] {prev.name} -> {cur.name}: {missing:+.1f} s unaccounted for")
-            warnings += 1
-
-    if partials:
-        print("\nUnfinished .partial files (the newest one is normal while the recorder is running):")
-        for path in partials:
-            packets = ffprobe_packets(path)
-            playable = packets[-1][0] - packets[0][0] if len(packets) > 1 else 0.0
-            print(f"  {path.name}: {path.stat().st_size / 1e6:.1f} MB, {playable:.1f} s playable")
-
-    print(f"\nFAIL={failures} WARN={warnings} stopped-and-restarted={runs}")
-    if failures:
-        print("RESULT: PROBLEMS FOUND")
-        return 1
-    print("RESULT: SEGMENTS OK")
+    plan = plan_deletions(files, now=time.time(), max_bytes=int(max_gb * GB),
+                          min_free_bytes=int(min_free_gb * GB), free_bytes=disk.free,
+                          max_age_days=s.max_age_days, protected=set())
+    print(f"Would delete now  : {len(plan)} segment(s)")
+    for f, reason in plan[:10]:
+        print(f"    {f.rel_path} ({f.size / 1e6:.1f} MB): {reason}")
+    if len(plan) > 10:
+        print(f"    ... and {len(plan) - 10} more")
     return 0
 
 
@@ -738,51 +1282,166 @@ if __name__ == "__main__":
 EOF
 ```
 
-## Retest
+```bash
+cat > ~/surveillance/tools/set_setting.py <<'EOF'
+#!/usr/bin/env python3
+"""Change one setting safely (validated, atomic write).
 
-**1. Clear the old test recordings** so the checker only sees segments from the new version. Your config should still have 60-second segments:
+    python3 ~/surveillance/tools/set_setting.py storage.max_storage_gb 45
+    python3 ~/surveillance/tools/set_setting.py storage.required_mount /mnt/cctv
+    python3 ~/surveillance/tools/set_setting.py --show
+
+Values are parsed as JSON when possible (numbers, true/false), otherwise used as text.
+Restart the recorder afterwards for the change to take effect.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import asdict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from app.config import DEFAULT_CONFIG_PATH, ConfigError, load_settings, save_settings, settings_from_dict  # noqa: E402
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Change one setting")
+    parser.add_argument("key", nargs="?", help="section.name, e.g. storage.max_storage_gb")
+    parser.add_argument("value", nargs="?")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    parser.add_argument("--show", action="store_true", help="print all current settings")
+    args = parser.parse_args()
+
+    try:
+        settings, _ = load_settings(args.config)
+    except ConfigError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
+    data = asdict(settings)
+    if args.show or args.key is None:
+        print(json.dumps(data, indent=2))
+        return 0
+    if args.value is None or args.key.count(".") != 1:
+        parser.error("usage: set_setting.py section.name value")
+
+    section, name = args.key.split(".")
+    if section not in data or name not in data[section]:
+        print(f"Unknown setting: {args.key}", file=sys.stderr)
+        return 2
+    try:
+        value = json.loads(args.value)
+    except json.JSONDecodeError:
+        value = args.value
+    old = data[section][name]
+    data[section][name] = value
+    try:
+        save_settings(settings_from_dict(data), args.config)
+    except ConfigError as exc:
+        print(f"Not saved: {exc}", file=sys.stderr)
+        return 2
+    print(f"{args.key}: {old!r} -> {value!r}  (restart the recorder to apply)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+EOF
+```
+
+## Test procedure
+
+Run everything as `ysak` from `~/surveillance`. You'll need two SSH windows for test A.
+
+**0. Add the new storage section to your settings file and look at the report.**
 
 ```bash
 cd ~/surveillance
-rm -rf recordings/*
-grep segment_seconds config/settings.json      # should show 60
+python3 tools/set_setting.py storage.max_storage_gb 45
+python3 tools/set_setting.py recording.segment_seconds 60
+python3 tools/phase5_storage_report.py
 ```
 
-**2. Record for about 4 minutes, then stop with Ctrl+C:**
+Note the **"GB free"** number on the `Disk` line; test C uses it.
+
+**A. Crash recovery (default limits).** In window 1, run `python3 -m app.main`. After about 90 seconds, kill it from window 2:
 
 ```bash
+pkill -9 -f "^python3 -m app.main"
+```
+
+Start `python3 -m app.main` again in window 1. **Within about 30–90 seconds** you should see a `Recovered unfinished segment …` line. Recovery waits until the file has been untouched for 60 seconds, so it can never grab a file that is still being written. Stop with Ctrl+C.
+
+**B. Size limit.** Set the limit to 0.03 GB, which is about 3 one-minute segments at your bitrate. Run for about 5 minutes:
+
+```bash
+python3 tools/set_setting.py storage.max_storage_gb 0.03
 python3 -m app.main
 ```
 
-**3. Start it again, record for about 1 minute, and stop.** This adds a second "first segment after a start", which is exactly the case that failed before.
-
-**4. Run the checker:**
+You should see `Deleted … over the 0.03 GB limit` lines. Stop with Ctrl+C, then check:
 
 ```bash
-python3 tools/phase4_check_segments.py
+python3 tools/phase5_storage_report.py      # Recordings should be about 0.03 GB or less
+python3 tools/phase4_check_segments.py      # the remaining segments still pass
 ```
 
-**5. If it passes, go back to 5-minute segments** (this was test E):
+**C. Free-space safety and the emergency pause.** This deletes your test recordings. Let **F** be the "GB free" number from step 0 (say 40).
+
+- **Low:** run `python3 tools/set_setting.py storage.min_free_gb 45`, using F + 5. Then run `python3 -m app.main` for about 2 minutes. Expect `Storage low: …` warnings and deletions, **while recording continues**.
+- **Critical:** run `python3 tools/set_setting.py storage.min_free_gb 100`, using any value above 2 × F. Run it again for about 1 minute. Expect `Storage critical: … PAUSED` and `Recording paused: storage is critically full`, and **no new segments**. Stop with Ctrl+C.
+
+**D. Unmounted SSD guard.** Set up a pretend SSD location, try to start, check that nothing was created on the SD card, then undo it in this order:
 
 ```bash
-sed -i 's/"segment_seconds": 60/"segment_seconds": 300/' config/settings.json
+python3 tools/set_setting.py paths.recordings_dir /mnt/cctv/recordings
+python3 tools/set_setting.py storage.required_mount /mnt/cctv
+python3 -m app.main           # should refuse and retry every 5, 10, 20 s; press Ctrl+C
+ls /mnt/cctv                  # should say: No such file or directory
+python3 tools/set_setting.py storage.required_mount '""'
+python3 tools/set_setting.py paths.recordings_dir recordings
+```
+
+**E. Restore the normal settings:**
+
+```bash
+python3 tools/set_setting.py storage.max_storage_gb 45
+python3 tools/set_setting.py storage.min_free_gb 2
+python3 tools/set_setting.py recording.segment_seconds 300
+python3 tools/set_setting.py --show
 ```
 
 ## Expected output
 
-The console should no longer show libcamera's `[0:43:48…] INFO` lines. Aligned segments should start within about 0.1 s of the minute:
+For test A, after the restart:
 
 ```text
-2026-09-23 22:40:05 INFO Main: Surveillance recorder 0.4.1 starting (...)
-2026-09-23 22:40:05 INFO Clock: System clock is NTP-synchronised
-2026-09-23 22:40:06 INFO Camera: Opened ov5647: main 1296x972, lores 640x480, 15 fps, sensor mode 1296x972
-2026-09-23 22:40:06 INFO Recorder: Started recording to /home/ysak/surveillance/recordings (60 s segments, ...)
-2026-09-23 22:41:00 INFO Recorder: Segment completed: 2026-09-23/14-40-06Z.mp4 start=...T14:40:06.4... duration=53.6s frames=804 ...
-2026-09-23 22:42:00 INFO Recorder: Segment completed: 2026-09-23/14-41-00Z.mp4 start=...T14:41:00.0... duration=60.0s frames=900 ...
+INFO Main: Surveillance recorder 0.5.0 starting (...)
+INFO StorageManager: Storage usage 0.03 GB / 45 GB, 40.1 GB free, 3 segments, oldest 2026-09-23 15:20 UTC
+INFO Recorder: Started recording to /home/ysak/surveillance/recordings (60 s segments, ...)
+WARNING StorageManager: Recovered unfinished segment 2026-09-23/15-24-00Z.mp4.partial -> 15-24-00Z.recovered.mp4: 31.9 s playable, removed 350 KiB of incomplete data
 ```
 
-The checker should end with `FAIL=0 WARN=0 stopped-and-restarted=1` and `RESULT: SEGMENTS OK`, with every line `[PASS]` including the first segment of each run.
+For test B:
 
-**If a first segment still shows a gap,** the checker now says where it is. A gap at `0.0 s` would mean the camera itself delivers its first frames unevenly at start-up, rather than my code stalling. The fix would then be to skip the first second of frames. Please send me the checker output either way.
+```text
+INFO Recorder: Segment completed: 2026-09-23/15-31-00Z.mp4 ... size=9.4MB
+INFO StorageManager: Deleted 2026-09-23/15-27-00Z.mp4 (9.4 MB): over the 0.03 GB limit
+```
 
-Once this passes, Phase 5 adds the storage limit (45 GB), the emergency free-space threshold, deleting the oldest finished segment first (never the one being written), and automatic recovery of `.partial` files after a crash.
+The Phase 4 checker reports a gap before each `.recovered.mp4`, and the lost time is only the last half-written fragment, about 2 s at most. You can also copy a `.recovered.mp4` to your laptop and play it.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `Not saved: …` from `set_setting.py` | The message says what's wrong. For test D, the two settings must be changed in the order shown. |
+| No `Recovered …` line after test A | Wait 90 s. If there's still nothing, check that a `.partial` exists: `ls recordings/*/`. |
+| `ffprobe is not available` | `sudo apt install -y ffmpeg` |
+| `Maximum storage … does not fit on this disk` | Informational: your SD card can't hold 45 GB while keeping 2 GB free, so the free-space rule applies first. It goes away with a bigger disk or a smaller limit. |
+
+**Please send me the `Recovered …` line from test A, a few `Deleted …` lines and the report from test B, and the log lines from tests C and D.**
+
+After test E, the recorder can safely run for long periods, because the SD card can no longer fill up. It still only runs while your SSH session is open; it becomes an automatically started service in Phase 13. Phase 6 adds motion detection on the 640×480 low-resolution stream.
