@@ -1,1348 +1,557 @@
-Phase 5 (storage management) is ready for you to run on the Pi. I tested it here with the same fake camera setup as before, but it hasn't run on your Pi yet.
+Phase 6 (motion detection) is ready to run on your Pi. Phase 5 passed, apart from one "critical storage" retest you need to do first because of a number I gave you. I tested Phase 6 here with synthetic scenes and the fake camera, not on your hardware.
 
-## What it does
+## Phase 5 results
 
-The storage manager checks every 30 seconds and again whenever a segment finishes.
+- **Test A (crash recovery):** passed. The unfinished file became `15-27-00Z.recovered.mp4` with 23.9 s playable, after cutting 204 KiB of half-written data.
+- **Test B (size limit):** passed. Deletions went oldest first, and the file being written was never touched.
+  - The checker's `+142.4 s unaccounted for` WARN is a checker mistake, not lost footage. You restarted at 15:30:59, the first frame arrived just after 15:31:00, so the new segment looked like a normal aligned one and the checker missed the restart. It now treats any gap over 10 s as a restart.
+  - The report's 1.09 Mbit/s estimate counted a segment stopped after 37.6 s as a full minute. It now uses only complete one-minute segments.
+- **Test C (free space):** the "low" part passed. The "critical" part **wasn't actually tested**, because of my instructions. The pause happens below half of `min_free_gb`; half of 100 is 50.0 GB and you had 50.23 GB free. My rule of "above 2 × free" meant above 100.46, and 100 was just under that. The retest with 120 is step 0 below.
+- **Test D (unmounted SSD):** passed. It refused to record, retried, and created nothing on the SD card.
+- **Test E** (restoring the normal settings) is still to do; it's part of step 0 below.
 
-- **Size limit.** While recordings take more than `max_storage_gb` (default 45 GB), it deletes the oldest finished segment. The segment currently being written (`.partial`) is never deleted, but its size does count towards the limit.
-- **Free-space safety.** While free space is below `min_free_gb` (default 2 GB), it also deletes oldest first. If nothing is left to delete, it logs a "Storage low" warning and keeps recording.
-- **Emergency pause.** If free space falls below half of `min_free_gb` (1 GB), writing pauses at the next keyframe. The camera keeps running, and writing resumes by itself once free space is back above 60 % (1.2 GB). The gap between the two thresholds stops it switching on and off repeatedly.
-- **Optional age limit.** `max_age_days` deletes anything older (0 = off).
-- **SSD guard for later.** `required_mount` (e.g. `/mnt/cctv`) makes the recorder refuse to record if that drive isn't mounted, instead of silently filling the SD card.
-- **Crash and power-cut recovery.** A leftover `.partial` that has been untouched for more than 60 seconds is cut back to its last complete 2-second fragment, checked with `ffprobe`, and renamed `….recovered.mp4`. If nothing playable remains, it is deleted.
-- **Logs.** Every deletion is logged, and a usage summary is logged every 10 minutes.
+## What Phase 6 adds
 
-Everything is based on what's on disk; the SQLite index comes in Phase 7.
+**How detection works:**
+1. The detector reads the 640×480 greyscale channel from the camera's low-resolution stream and halves it to 320×240.
+2. It does this about 5 times per second, while the full-quality recording carries on untouched.
+3. Each frame is blurred to remove sensor noise and compared with a slowly updating picture of the empty scene, called the background.
+4. It then finds the **largest connected patch of changed pixels**.
 
-## What I tested
+Using the largest single patch rather than the total number of changed pixels means scattered noise can't add up to a false trigger.
 
-- **Deletion order:** oldest first, with the segment being written protected. Empty folders from earlier days were removed.
-- **Recovery:** I cut a real fragmented recording at 70 % to simulate a power cut. Recovery removed the 61 KiB half-written tail, leaving 8.0 s that decodes with no errors. **Chrome showed the correct 8.00 s length and seeked within it.** A junk `.partial` was deleted.
-- **End to end with the fake camera** (0.02 GB limit, 60 s segments): a crashed `.partial` was recovered before the camera started, deletions kept usage at or below the limit, and the file being written was never touched.
-- **Free-space states:** with a 2 GB minimum, simulated free space of 10 → 1.5 → 0.9 → 1.1 → 1.3 → 2.5 GB gave `ok → low → critical (paused) → still paused → low (resumed) → ok`.
-- **Pause and resume inside the recorder:** writing paused at the first keyframe after storage became critical, and resumed at the first keyframe after it recovered, in a new file.
-- **Unmounted SSD path:** the recorder refused to start, retried with increasing waits, and created no folder on the SD card.
-- **Invalid settings** were rejected: a recordings folder outside `required_mount`, text where a number belongs, and negative sizes.
+**Settings** (in the new `motion` section):
 
-## Files
+| Setting | Default | Meaning |
+|---|---|---|
+| `sensitivity` | 70 | 1–100. Higher means a smaller brightness change counts. 70 means a change of 28 out of 255. |
+| `min_area_percent` | 0.5 | The patch must cover this much of the frame, about 20×20 pixels. |
+| `trigger_frames` | 3 | Movement must be seen in 3 analysed frames in a row (about 0.6 s). Single-frame flickers are ignored. |
+| `cooldown_seconds` | 10 | An event ends only after 10 s with no movement, so one continuous movement is one event. |
+| `analysis_fps` | 5 | Frames analysed per second. |
+| `enabled` | true | Turns motion detection on or off. |
 
-| File | Status |
-|---|---|
-| `app/__init__.py` | Version 0.5.0 |
-| `app/config.py` | New `storage` section |
-| `app/storage_manager.py` | **New** |
-| `app/recorder.py` | Pause and resume, refuses an unmounted drive, reports which file is being written |
-| `app/main.py` | Starts the storage manager and runs recovery before the camera starts |
-| `tools/phase5_storage_report.py` | **New.** Read-only report: usage, limits, bitrate, hours of history, what would be deleted |
-| `tools/set_setting.py` | **New.** Change one setting safely (validated, atomic save) |
+**Other behaviour:**
+- **Lighting changes:** if more than 60 % of the frame changes at once (lights switched on, exposure jumps), the background is relearned instead of reporting motion.
+- **Selective learning:** pixels that are currently changing are learned at half speed. A walking person doesn't leave a "ghost trail" that stretches the event. Someone who stops and stands still becomes part of the background after about 15 s.
+- **Logs:** `Motion started (area 3.3% of the frame)` and `Motion ended after 14.2 s (peak area 7.1%)`. Each segment's log line now ends in `motion=yes` or `motion=no`. Phase 7 will store both in SQLite.
+- **Robustness:** OpenCV is loaded **before** the camera starts (the same lesson as PyAV). If OpenCV is missing, recording still works, with motion detection disabled and an error in the log.
 
-`fileutil.py`, `clock.py`, `camera.py`, `logging_setup.py` and `phase4_check_segments.py` are unchanged. Paste each block below from `~/surveillance`.
+## What I tested here
+
+**Synthetic 60-second scene with realistic sensor noise.** Results before and after the selective-learning change:
+
+| Scenario | Before | After (shipped) |
+|---|---|---|
+| A single-frame blip at 10 s | ignored | ignored |
+| Walking at 20–26 s, pausing 4 s, walking back 30–33 s | one event, 20.0–33.0 s | one event, **20.0–32.8 s** |
+| Lights switching on | recognised, not reported as motion | same |
+| Walking in, then standing still | not measured | event ends about 15 s after they stop |
+
+**Fake camera, end to end:** a moving object from 20 to 32 s after start gave one event. The two segments overlapping it were marked `motion=yes` and the next one `motion=no`.
+
+**Tuning tool:** it caught 11.8 s of the 12 s movement, the quiet-scene noise level was 0.00 %, and analysis took 0.3 ms per frame on this machine (expect a few ms on the Pi). Its debug image showed only the moving object in the mask, with no noise.
+
+## Install
 
 ```bash
-cat > ~/surveillance/app/__init__.py <<'EOF'
-"""Raspberry Pi surveillance camera."""
-
-__version__ = "0.5.0"
-EOF
+sudo apt install -y python3-opencv
+python3 -c "import cv2; print(cv2.__version__)"
 ```
 
+## Update the files
+
+**1. Apply the update script.** It changes `__init__.py`, `config.py`, `recorder.py`, `storage_manager.py` and the two report tools. It checks that every piece of code it replaces is exactly what I gave you in Phase 5, makes `.bak` backups, and changes nothing if any check fails. I tested it on copies of your 0.5.0 files: the result is identical to what I tested, and running it twice safely aborts.
+
 ```bash
-cat > ~/surveillance/app/config.py <<'EOF'
-"""Typed, validated settings stored as JSON.
-
-Every value is checked for type and range when loaded, so a typo or an out-of-range
-value stops the service with a clear message instead of misbehaving later.
-"""
-from __future__ import annotations
-
-import json
-import re
-from dataclasses import asdict, dataclass, field, fields
+cd ~/surveillance
+cat > update_to_0_6_0.py <<'EOF'
+#!/usr/bin/env python3
+"""Update the surveillance project from 0.5.0 to 0.6.0 (run from ~/surveillance)."""
+import shutil, sys
 from pathlib import Path
-from typing import Any
 
-from app.fileutil import atomic_write_bytes
+EDITS = [
+    ('app/__init__.py',
+     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.5.0"\n',
+     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.6.0"\n'),
+    ('app/config.py',
+     '\n@dataclass(frozen=True)\nclass PathSettings:\n    recordings_dir: str = "recordings"\n',
+     '\n@dataclass(frozen=True)\nclass MotionSettings:\n    enabled: bool = True\n    sensitivity: int = 70\n    min_area_percent: float = 0.5\n    cooldown_seconds: float = 10.0\n    trigger_frames: int = 3\n    analysis_fps: float = 5.0\n\n    def validate(self) -> None:\n        _check_range("motion.sensitivity", self.sensitivity, 1, 100)\n        _check_range("motion.min_area_percent", self.min_area_percent, 0.05, 50.0)\n        _check_range("motion.cooldown_seconds", self.cooldown_seconds, 1.0, 300.0)\n        _check_range("motion.trigger_frames", self.trigger_frames, 1, 20)\n        _check_range("motion.analysis_fps", self.analysis_fps, 1.0, 15.0)\n\n\n@dataclass(frozen=True)\nclass PathSettings:\n    recordings_dir: str = "recordings"\n'),
+    ('app/config.py',
+     '    recording: RecordingSettings = field(default_factory=RecordingSettings)\n    storage: StorageSettings = field(default_factory=StorageSettings)\n    paths: PathSettings = field(default_factory=PathSettings)\n    logging: LoggingSettings = field(default_factory=LoggingSettings)\n',
+     '    recording: RecordingSettings = field(default_factory=RecordingSettings)\n    storage: StorageSettings = field(default_factory=StorageSettings)\n    motion: MotionSettings = field(default_factory=MotionSettings)\n    paths: PathSettings = field(default_factory=PathSettings)\n    logging: LoggingSettings = field(default_factory=LoggingSettings)\n'),
+    ('app/config.py',
+     '        for section in fields(self):\n            getattr(self, section.name).validate()\n        mount = self.storage.required_mount\n        if mount and not self.recordings_dir.is_relative_to(Path(mount)):\n',
+     '        for section in fields(self):\n            getattr(self, section.name).validate()\n        if self.motion.analysis_fps > self.camera.framerate:\n            raise ConfigError("motion.analysis_fps cannot be higher than camera.framerate")\n        mount = self.storage.required_mount\n        if mount and not self.recordings_dir.is_relative_to(Path(mount)):\n'),
+    ('app/recorder.py',
+     'from __future__ import annotations\n\nimport logging\nimport math\n',
+     'from __future__ import annotations\n\nimport dataclasses\nimport logging\nimport math\n'),
+    ('app/recorder.py',
+     '    frames: int\n    clock_synced: bool | None\n\n\n',
+     '    frames: int\n    clock_synced: bool | None\n    has_motion: bool | None = None   # None when motion detection is off\n\n\n'),
+    ('app/recorder.py',
+     '        self._boundary_thread: threading.Thread | None = None\n        self._listeners: list[Callable[[Segment], None]] = []\n        self.last_segment: Segment | None = None\n\n    def add_listener(self, callback: Callable[[Segment], None]) -> None:\n        self._listeners.append(callback)\n\n    @property\n',
+     '        self._boundary_thread: threading.Thread | None = None\n        self._listeners: list[Callable[[Segment], None]] = []\n        self._motion = None\n        self._motion_listeners: list[Callable] = []\n        self.last_segment: Segment | None = None\n\n    def add_listener(self, callback: Callable[[Segment], None]) -> None:\n        self._listeners.append(callback)\n\n    def add_motion_listener(self, callback: Callable) -> None:\n        """callback(kind, event) with kind \'start\' or \'end\'."""\n        self._motion_listeners.append(callback)\n\n    @property\n    def motion_active(self) -> bool | None:\n        return self._motion.active if self._motion else None\n\n    @property\n'),
+    ('app/recorder.py',
+     '        if not os.access(self.recordings_dir, os.W_OK):\n            raise PermissionError(f"recordings directory is not writable: {self.recordings_dir}")\n        self._finalizer.start()\n\n',
+     '        if not os.access(self.recordings_dir, os.W_OK):\n            raise PermissionError(f"recordings directory is not writable: {self.recordings_dir}")\n        # Imported before the encoder starts: loading OpenCV holds the interpreter lock long\n        # enough to make the encoder thread drop frames.\n        motion_detector_cls = self._load_motion_detector() if self.settings.motion.enabled else None\n        self._finalizer.start()\n\n'),
+    ('app/recorder.py',
+     '                 self.recordings_dir, self.settings.recording.segment_seconds, cam.bitrate / 1e6,\n                 cam.keyframe_seconds)\n\n    def stop(self) -> None:\n        was_recording = self._recording\n        self._boundary_stop.set()\n        if self._boundary_thread is not None and self._boundary_thread.is_alive():\n',
+     '                 self.recordings_dir, self.settings.recording.segment_seconds, cam.bitrate / 1e6,\n                 cam.keyframe_seconds)\n        if motion_detector_cls is not None:\n            self._motion = motion_detector_cls(self._camera.picam2, self.settings.motion,\n                                               self._motion_listeners)\n            self._motion.start()\n\n    @staticmethod\n    def _load_motion_detector():\n        try:\n            from app.motion_detector import MotionDetector\n        except ImportError as exc:\n            log.error("Motion detection disabled: OpenCV is not installed (%s). "\n                      "Install it with: sudo apt install -y python3-opencv", exc)\n            return None\n        return MotionDetector\n\n    def stop(self) -> None:\n        was_recording = self._recording\n        if self._motion is not None:\n            self._motion.stop()\n        self._boundary_stop.set()\n        if self._boundary_thread is not None and self._boundary_thread.is_alive():\n'),
+    ('app/recorder.py',
+     '        fsync_directory(seg.final_path.parent)\n        segment = self._output.segment_metadata(seg, seg.final_path.stat().st_size)\n        self.last_segment = segment\n        log.info("Segment completed: %s start=%s duration=%.1fs frames=%d size=%.1fMB%s",\n                 segment.rel_path, segment.start_utc.isoformat(timespec="milliseconds"),\n                 segment.duration_s, segment.frames, segment.size_bytes / 1e6,\n                 {True: "", False: " (clock NOT synchronised)"}.get(segment.clock_synced,\n                                                                     " (clock sync unknown)"))\n',
+     '        fsync_directory(seg.final_path.parent)\n        segment = self._output.segment_metadata(seg, seg.final_path.stat().st_size)\n        if self._motion is not None:\n            events = self._motion.events_between(segment.start_utc.timestamp(), segment.end_utc.timestamp())\n            segment = dataclasses.replace(segment, has_motion=bool(events))\n        self.last_segment = segment\n        log.info("Segment completed: %s start=%s duration=%.1fs frames=%d size=%.1fMB%s%s",\n                 segment.rel_path, segment.start_utc.isoformat(timespec="milliseconds"),\n                 segment.duration_s, segment.frames, segment.size_bytes / 1e6,\n                 {True: " motion=yes", False: " motion=no"}.get(segment.has_motion, ""),\n                 {True: "", False: " (clock NOT synchronised)"}.get(segment.clock_synced,\n                                                                     " (clock sync unknown)"))\n'),
+    ('app/storage_manager.py',
+     '        if not self._warned_capacity and self._max_bytes > used + disk.free - self._min_free_bytes:\n            self._warned_capacity = True\n            log.warning("Maximum storage %.1f GB does not fit on this disk while keeping %.1f GB free "\n                        "(room for about %.1f GB); the free-space limit will apply first",\n                        self._max_bytes / GB, self._min_free_bytes / GB,\n                        max(0, used + disk.free - self._min_free_bytes) / GB)\n',
+     '        if not self._warned_capacity and self._max_bytes > used + disk.free - self._min_free_bytes:\n            self._warned_capacity = True\n            log.warning("Maximum storage %g GB does not fit on this disk while keeping %g GB free "\n                        "(room for about %.2f GB); the free-space limit will apply first",\n                        self._max_bytes / GB, self._min_free_bytes / GB,\n                        max(0, used + disk.free - self._min_free_bytes) / GB)\n'),
+    ('app/storage_manager.py',
+     '        elif disk.free < self._min_free_bytes:\n            state = "low"\n            message = (f"only {disk.free / GB:.2f} GB free (minimum {self._min_free_bytes / GB:g} GB); "\n                       f"something other than recordings is filling the disk")\n        elif used > self._max_bytes:\n            state = "low"\n',
+     '        elif disk.free < self._min_free_bytes:\n            state = "low"\n            message = (f"only {disk.free / GB:.2f} GB free (minimum {self._min_free_bytes / GB:g} GB) and no "\n                       f"older recordings left to delete; check what else is using the disk")\n        elif used > self._max_bytes:\n            state = "low"\n'),
+    ('tools/phase5_storage_report.py',
+     '          f"{fmt_time(complete[-1].start if complete else None)}")\n\n    full = [f for f in complete if f.start % seg_len == 0 and not f.path.name.endswith(RECOVERED_SUFFIX)]\n    sample = full[-BITRATE_SAMPLE_SEGMENTS - 1:-1] or full[-BITRATE_SAMPLE_SEGMENTS:]\n    if sample:\n        bytes_per_s = sum(f.size for f in sample) / (len(sample) * seg_len)\n',
+     '          f"{fmt_time(complete[-1].start if complete else None)}")\n\n    # Only segments that filled their whole slot (the next one starts exactly one length later).\n    full = [a for a, b in zip(complete, complete[1:])\n            if a.start % seg_len == 0 and b.start - a.start == seg_len\n            and not a.path.name.endswith(RECOVERED_SUFFIX)]\n    sample = full[-BITRATE_SAMPLE_SEGMENTS:]\n    if sample:\n        bytes_per_s = sum(f.size for f in sample) / (len(sample) * seg_len)\n'),
+    ('tools/phase4_check_segments.py',
+     '            continue\n        missing = (cur_start - prev_start).total_seconds() - prev_dur\n        # The first segment after a (re)start is named after its real start time, not a boundary.\n        restarted = cur_start.timestamp() % seg_len != 0\n        if restarted:\n            print(f"  [INFO] {prev.name} -> {cur.name}: recorder stopped/restarted, "\n',
+     '            continue\n        missing = (cur_start - prev_start).total_seconds() - prev_dur\n        # The first segment after a (re)start is named after its real start time, not a boundary;\n        # a restart that happens to land on a boundary shows up as a gap of more than 10 s.\n        restarted = cur_start.timestamp() % seg_len != 0 or missing > 10\n        if restarted:\n            print(f"  [INFO] {prev.name} -> {cur.name}: recorder stopped/restarted, "\n'),
+]
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "settings.json"
-
-ALLOWED_SEGMENT_SECONDS = (60, 120, 300, 600, 900, 1800, 3600)
-LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
-LOG_FORMATS = ("text", "json")
-RETENTION_MODES = ("oldest_first",)
-MAX_ENCODER_PIXELS = 1920 * 1080
-CAMERA_NAME_PATTERN = re.compile(r"^[\w][\w .,'()-]{0,39}$")
-
-
-class ConfigError(ValueError):
-    pass
-
-
-@dataclass(frozen=True)
-class CameraSettings:
-    camera_num: int = 0
-    name: str = "Camera 1"
-    width: int = 1296
-    height: int = 972
-    lores_width: int = 640
-    lores_height: int = 480
-    framerate: float = 15.0
-    bitrate: int = 2_500_000
-    keyframe_seconds: float = 2.0
-    rotate180: bool = False
-
-    def validate(self) -> None:
-        _check_range("camera.camera_num", self.camera_num, 0, 3)
-        if not CAMERA_NAME_PATTERN.match(self.name):
-            raise ConfigError("camera.name must be 1-40 letters, digits, spaces or . , ' ( ) - _")
-        _check_range("camera.width", self.width, 64, 1920)
-        _check_range("camera.height", self.height, 64, 1920)
-        if self.width % 16 or self.height % 2:
-            raise ConfigError("camera.width must be a multiple of 16 and camera.height must be even")
-        if self.width * self.height > MAX_ENCODER_PIXELS:
-            raise ConfigError("camera.width x camera.height exceeds the 1920x1080 hardware encoder limit")
-        _check_range("camera.lores_width", self.lores_width, 160, self.width)
-        _check_range("camera.lores_height", self.lores_height, 120, self.height)
-        if self.lores_width % 16 or self.lores_height % 2:
-            raise ConfigError("camera.lores_width must be a multiple of 16 and lores_height even")
-        _check_range("camera.framerate", self.framerate, 1.0, 30.0)
-        _check_range("camera.bitrate", self.bitrate, 250_000, 10_000_000)
-        _check_range("camera.keyframe_seconds", self.keyframe_seconds, 0.5, 10.0)
-
-    @property
-    def keyframe_interval_frames(self) -> int:
-        return max(1, round(self.keyframe_seconds * self.framerate))
-
-
-@dataclass(frozen=True)
-class RecordingSettings:
-    segment_seconds: int = 300
-
-    def validate(self) -> None:
-        if self.segment_seconds not in ALLOWED_SEGMENT_SECONDS:
-            allowed = ", ".join(str(value) for value in ALLOWED_SEGMENT_SECONDS)
-            raise ConfigError(f"recording.segment_seconds must be one of: {allowed}")
-
-
-@dataclass(frozen=True)
-class StorageSettings:
-    max_storage_gb: float = 45.0
-    min_free_gb: float = 2.0
-    max_age_days: int = 0
-    retention: str = "oldest_first"
-    required_mount: str = ""
-
-    def validate(self) -> None:
-        _check_range("storage.max_storage_gb", self.max_storage_gb, 0.01, 100_000)
-        _check_range("storage.min_free_gb", self.min_free_gb, 0.1, 10_000)
-        _check_range("storage.max_age_days", self.max_age_days, 0, 3650)
-        if self.retention not in RETENTION_MODES:
-            raise ConfigError(f"storage.retention must be one of: {', '.join(RETENTION_MODES)}")
-        if self.required_mount and not Path(self.required_mount).is_absolute():
-            raise ConfigError("storage.required_mount must be empty or an absolute path such as /mnt/cctv")
-
-
-@dataclass(frozen=True)
-class PathSettings:
-    recordings_dir: str = "recordings"
-    log_dir: str = "logs"
-
-    def validate(self) -> None:
-        for name in ("recordings_dir", "log_dir"):
-            value = getattr(self, name)
-            if not value.strip() or "\x00" in value:
-                raise ConfigError(f"paths.{name} must be a non-empty path")
-
-
-@dataclass(frozen=True)
-class LoggingSettings:
-    level: str = "INFO"
-    format: str = "text"
-    console: bool = True
-    max_bytes: int = 5_000_000
-    backup_count: int = 5
-
-    def validate(self) -> None:
-        if self.level not in LOG_LEVELS:
-            raise ConfigError(f"logging.level must be one of: {', '.join(LOG_LEVELS)}")
-        if self.format not in LOG_FORMATS:
-            raise ConfigError(f"logging.format must be one of: {', '.join(LOG_FORMATS)}")
-        _check_range("logging.max_bytes", self.max_bytes, 100_000, 50_000_000)
-        _check_range("logging.backup_count", self.backup_count, 1, 20)
-
-
-@dataclass(frozen=True)
-class Settings:
-    camera: CameraSettings = field(default_factory=CameraSettings)
-    recording: RecordingSettings = field(default_factory=RecordingSettings)
-    storage: StorageSettings = field(default_factory=StorageSettings)
-    paths: PathSettings = field(default_factory=PathSettings)
-    logging: LoggingSettings = field(default_factory=LoggingSettings)
-
-    def validate(self) -> None:
-        for section in fields(self):
-            getattr(self, section.name).validate()
-        mount = self.storage.required_mount
-        if mount and not self.recordings_dir.is_relative_to(Path(mount)):
-            raise ConfigError(f"paths.recordings_dir ({self.recordings_dir}) must be inside "
-                              f"storage.required_mount ({mount})")
-
-    @property
-    def recordings_dir(self) -> Path:
-        return resolve_path(self.paths.recordings_dir)
-
-    @property
-    def log_dir(self) -> Path:
-        return resolve_path(self.paths.log_dir)
-
-
-def resolve_path(value: str) -> Path:
-    """Relative paths are relative to the project directory, so the app works from any cwd."""
-    path = Path(value).expanduser()
-    return path if path.is_absolute() else PROJECT_ROOT / path
-
-
-def _check_range(name: str, value: float, low: float, high: float) -> None:
-    if not low <= value <= high:
-        raise ConfigError(f"{name} must be between {low:g} and {high:g} (got {value!r})")
-
-
-def _coerce(value: Any, expected: type, name: str) -> Any:
-    if expected is bool:
-        if isinstance(value, bool):
-            return value
-    elif expected is int:
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value
-    elif expected is float:
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return float(value)
-    elif expected is str:
-        if isinstance(value, str):
-            return value
-    raise ConfigError(f"{name} must be of type {expected.__name__} (got {value!r})")
-
-
-def _build_section(cls: type, data: Any, section: str) -> Any:
-    if not isinstance(data, dict):
-        raise ConfigError(f"'{section}' must be a JSON object")
-    known = {f.name for f in fields(cls)}
-    unknown = sorted(set(data) - known)
-    if unknown:
-        raise ConfigError(f"unknown setting(s) in '{section}': {', '.join(unknown)}")
-    defaults = cls()
-    values = {}
-    for f in fields(cls):
-        default = getattr(defaults, f.name)
-        values[f.name] = (_coerce(data[f.name], type(default), f"{section}.{f.name}")
-                          if f.name in data else default)
-    return cls(**values)
-
-
-def settings_from_dict(data: Any) -> Settings:
-    if not isinstance(data, dict):
-        raise ConfigError("settings file must contain a JSON object")
-    section_types = {f.name: type(getattr(Settings(), f.name)) for f in fields(Settings)}
-    unknown = sorted(set(data) - set(section_types))
-    if unknown:
-        raise ConfigError(f"unknown section(s): {', '.join(unknown)}")
-    settings = Settings(**{name: _build_section(cls, data.get(name, {}), name)
-                           for name, cls in section_types.items()})
-    settings.validate()
-    return settings
-
-
-def load_settings(path: Path = DEFAULT_CONFIG_PATH, create_if_missing: bool = True) -> tuple[Settings, bool]:
-    """Return (settings, created). A missing file is created with defaults if allowed."""
-    if not path.exists():
-        if not create_if_missing:
-            raise ConfigError(f"{path} does not exist")
-        settings = Settings()
-        save_settings(settings, path)
-        return settings, True
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ConfigError(f"{path}: invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}") from None
-    except OSError as exc:
-        raise ConfigError(f"cannot read {path}: {exc.strerror}") from None
-    return settings_from_dict(data), False
-
-
-def save_settings(settings: Settings, path: Path = DEFAULT_CONFIG_PATH) -> None:
-    settings.validate()
-    text = json.dumps(asdict(settings), indent=2) + "\n"
-    atomic_write_bytes(path, text.encode("utf-8"))
+texts = {}
+for rel, old, new in EDITS:
+    text = texts.setdefault(rel, Path(rel).read_text())
+    if text.count(old) != 1:
+        sys.exit(f"ABORTED, nothing changed: {rel} does not match the expected 0.5.0 code "
+                 f"(found {text.count(old)} matches for:\n{old})")
+    texts[rel] = text.replace(old, new)
+for rel, text in texts.items():
+    shutil.copy2(rel, rel + ".bak")
+    Path(rel).write_text(text)
+    print(f"updated {rel}  (backup: {rel}.bak)")
+print("Update to 0.6.0 complete.")
 EOF
+python3 update_to_0_6_0.py
 ```
 
-```bash
-cat > ~/surveillance/app/storage_manager.py <<'EOF'
-"""Storage quota, free-space safety and crash recovery for recording segments.
+It should print six `updated …` lines and then `Update to 0.6.0 complete.` If it prints `ABORTED`, nothing was changed; send me the message.
 
-Rules:
-  * Only completed segments (*.mp4) are ever deleted, oldest first. The segment being
-    written (*.mp4.partial) is never touched.
-  * Delete while usage > max_storage_gb, or free space < min_free_gb, or a segment is older
-    than max_age_days (if set).
-  * If free space falls below half of min_free_gb with nothing left to delete, writing pauses
-    (the camera keeps running) and resumes automatically once space is available again.
-  * Unfinished .partial files left by a crash or power cut are trimmed to their last complete
-    fragment and renamed *.recovered.mp4, or deleted if nothing playable remains.
+**2. The new motion detector:**
+
+```bash
+cat > ~/surveillance/app/motion_detector.py <<'EOF'
+"""Lightweight motion detection on the low-resolution stream.
+
+No AI and no object recognition: each analysed frame is compared with a slowly updating
+background image, and the largest connected region of changed pixels decides whether
+something moved. Frame scores are turned into events with a debounce (movement must be
+seen in several frames in a row) and a cooldown (an event only ends after a quiet period),
+so one continuous movement produces one event.
 """
 from __future__ import annotations
 
 import logging
-import os
-import shutil
-import struct
-import subprocess
 import threading
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Callable
 
-from app.config import Settings
-from app.fileutil import fsync_directory
+import cv2
+import numpy as np
 
-log = logging.getLogger("StorageManager")
+from app.config import MotionSettings
 
-GB = 1_000_000_000
-CHECK_INTERVAL_S = 30.0
-USAGE_LOG_INTERVAL_S = 600.0
-PARTIAL_STALE_S = 60.0
-MIN_PLAYABLE_S = 1.0
-CRITICAL_FRACTION = 0.5
-RESUME_FRACTION = 0.6
-MAX_INDIVIDUAL_DELETE_LOGS = 5
+log = logging.getLogger("MotionDetector")
 
-SEGMENT_SUFFIX = ".mp4"
-PARTIAL_SUFFIX = ".mp4.partial"
-RECOVERED_SUFFIX = ".recovered.mp4"
+ANALYSIS_WIDTH = 320
+BLUR_KERNEL = (5, 5)
+BACKGROUND_ALPHA = 0.04
+MOVING_ALPHA_FACTOR = 0.5
+RELEARN_ALPHA = 0.5
+LIGHTING_CHANGE_PERCENT = 60.0
+RELEARN_SECONDS = 1.0
+MAX_EVENT_SECONDS = 3600.0
+CAPTURE_TIMEOUT_S = 2.0
+RECENT_EVENTS = 500
 
 
-@dataclass(frozen=True)
-class SegmentFile:
-    path: Path
-    rel_path: str
-    size: int          # bytes actually allocated on disk
-    start: float       # UTC epoch seconds, from the file name (mtime as fallback)
-    mtime: float
-    partial: bool
+def sensitivity_to_threshold(sensitivity: int) -> int:
+    """Sensitivity 1..100 -> minimum brightness change (0..255) for a pixel to count as changed."""
+    return round(70 - 0.6 * sensitivity)
 
 
 @dataclass(frozen=True)
-class StorageStatus:
-    state: str         # ok | low | critical | unavailable
-    message: str
-    used_bytes: int
-    free_bytes: int
-    total_bytes: int
-    max_bytes: int
-    min_free_bytes: int
-    segment_count: int
-    oldest_start: float | None
-    newest_start: float | None
+class FrameScore:
+    largest_percent: float   # biggest connected changed region, % of the frame
+    total_percent: float     # all changed pixels, % of the frame
+    moving: bool
+    lighting_change: bool
 
 
-def parse_segment_start(day: str, name: str) -> float | None:
-    """'2026-09-23', '14-05-00Z.mp4' -> UTC epoch seconds."""
-    stem = name.split("Z", 1)[0]
-    try:
-        return datetime.strptime(f"{day} {stem}", "%Y-%m-%d %H-%M-%S").replace(
-            tzinfo=timezone.utc).timestamp()
-    except ValueError:
-        return None
+@dataclass
+class MotionEvent:
+    start: float                     # UTC epoch seconds
+    end: float | None = None
+    peak_percent: float = 0.0
+
+    @property
+    def duration(self) -> float:
+        return (self.end if self.end is not None else time.time()) - self.start
 
 
-def scan_segments(root: Path) -> list[SegmentFile]:
-    """All segment and partial files under root, oldest first."""
-    found: list[SegmentFile] = []
-    try:
-        days = [entry for entry in os.scandir(root) if entry.is_dir(follow_symlinks=False)]
-    except FileNotFoundError:
-        return found
-    for day in days:
-        try:
-            entries = list(os.scandir(day.path))
-        except OSError as exc:
-            log.error("Cannot read %s: %s", day.path, exc.strerror)
-            continue
-        for entry in entries:
-            name = entry.name
-            partial = name.endswith(PARTIAL_SUFFIX)
-            if not (partial or name.endswith(SEGMENT_SUFFIX)) or name.startswith("."):
-                continue
-            try:
-                st = entry.stat(follow_symlinks=False)
-            except FileNotFoundError:
-                continue
-            start = parse_segment_start(day.name, name)
-            found.append(SegmentFile(path=Path(entry.path), rel_path=f"{day.name}/{name}",
-                                     size=st.st_blocks * 512, start=start if start is not None else st.st_mtime,
-                                     mtime=st.st_mtime, partial=partial))
-    found.sort(key=lambda f: (f.start, f.rel_path))
-    return found
+class MotionAnalyzer:
+    """Pure image analysis: feed greyscale frames, get a score. No camera and no threads."""
+
+    def __init__(self, settings: MotionSettings) -> None:
+        self.threshold = sensitivity_to_threshold(settings.sensitivity)
+        self.min_area_percent = settings.min_area_percent
+        self._background: np.ndarray | None = None
+        self._relearn_until = 0.0
+        self.last_mask: np.ndarray | None = None
+
+    def analyze(self, gray: np.ndarray, now: float) -> FrameScore:
+        blurred = cv2.GaussianBlur(gray, BLUR_KERNEL, 0)
+        if self._background is None:
+            self._background = blurred.astype(np.float32)
+            self._relearn_until = now + RELEARN_SECONDS
+            return FrameScore(0.0, 0.0, False, False)
+        if now < self._relearn_until:
+            cv2.accumulateWeighted(blurred, self._background, RELEARN_ALPHA)
+            return FrameScore(0.0, 0.0, False, False)
+
+        diff = cv2.absdiff(blurred, cv2.convertScaleAbs(self._background))
+        _, mask = cv2.threshold(diff, self.threshold, 255, cv2.THRESH_BINARY)
+        mask = cv2.dilate(mask, None, iterations=2)
+        self.last_mask = mask
+        # Moving pixels are learned more slowly so a moving object leaves little "ghost" trail
+        # behind it; something that stops (a parked car) still becomes background after a while.
+        cv2.accumulateWeighted(blurred, self._background, BACKGROUND_ALPHA, mask=cv2.bitwise_not(mask))
+        cv2.accumulateWeighted(blurred, self._background, BACKGROUND_ALPHA * MOVING_ALPHA_FACTOR, mask=mask)
+        total = cv2.countNonZero(mask) * 100.0 / mask.size
+        if total >= LIGHTING_CHANGE_PERCENT:
+            # Lights switched on/off or an exposure jump: relearn instead of reporting motion.
+            self._background = blurred.astype(np.float32)
+            self._relearn_until = now + RELEARN_SECONDS
+            return FrameScore(0.0, total, False, True)
+        count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        largest = float(stats[1:, cv2.CC_STAT_AREA].max()) * 100.0 / mask.size if count > 1 else 0.0
+        return FrameScore(largest, total, largest >= self.min_area_percent, False)
 
 
-def plan_deletions(files: list[SegmentFile], *, now: float, max_bytes: int, min_free_bytes: int,
-                   free_bytes: int, max_age_days: int, protected: set[Path]) -> list[tuple[SegmentFile, str]]:
-    """Pure decision function: which completed segments to delete (oldest first) and why."""
-    usage = sum(f.size for f in files)
-    cutoff = now - max_age_days * 86400 if max_age_days else None
-    plan = []
-    for f in files:
-        if f.partial or f.path in protected:
-            continue
-        if cutoff is not None and f.start < cutoff:
-            reason = f"older than {max_age_days} day(s)"
-        elif usage > max_bytes:
-            reason = f"over the {max_bytes / GB:g} GB limit"
-        elif free_bytes < min_free_bytes:
-            reason = f"free space below {min_free_bytes / GB:g} GB"
+class MotionEventTracker:
+    """Turns per-frame scores into events: debounce, cooldown, one event per continuous movement."""
+
+    def __init__(self, trigger_frames: int, cooldown_seconds: float,
+                 on_start: Callable[[MotionEvent], None], on_end: Callable[[MotionEvent], None]) -> None:
+        self._trigger_frames = trigger_frames
+        self._cooldown = cooldown_seconds
+        self._on_start = on_start
+        self._on_end = on_end
+        self._streak = 0
+        self._streak_start = 0.0
+        self._streak_peak = 0.0
+        self._last_motion = 0.0
+        self.current: MotionEvent | None = None
+
+    def update(self, moving: bool, percent: float, now: float) -> None:
+        if moving:
+            if self._streak == 0:
+                self._streak_start = now
+                self._streak_peak = 0.0
+            self._streak += 1
+            self._streak_peak = max(self._streak_peak, percent)
+            self._last_motion = now
+            if self.current is None:
+                if self._streak >= self._trigger_frames:
+                    self.current = MotionEvent(start=self._streak_start, peak_percent=self._streak_peak)
+                    self._on_start(self.current)
+            else:
+                self.current.peak_percent = max(self.current.peak_percent, percent)
+                if now - self.current.start >= MAX_EVENT_SECONDS:
+                    self._finish(now)
+                    self.current = MotionEvent(start=now, peak_percent=percent)
+                    self._on_start(self.current)
         else:
-            break
-        plan.append((f, reason))
-        usage -= f.size
-        free_bytes += f.size
-    return plan
+            self._streak = 0
+            if self.current is not None and now - self._last_motion >= self._cooldown:
+                self._finish(self._last_motion)
+
+    def flush(self) -> None:
+        if self.current is not None:
+            self._finish(self._last_motion)
+
+    def _finish(self, end: float) -> None:
+        event, self.current = self.current, None
+        event.end = max(end, event.start)
+        self._on_end(event)
 
 
-def trim_to_complete_fragments(path: Path) -> tuple[int, int]:
-    """Cut a fragmented MP4 after its last complete fragment. Returns (old_size, new_size).
-
-    A power cut leaves a half-written moof/mdat box at the end; removing it makes the
-    file well-formed so browsers play it to the end instead of stalling.
-    """
-    with open(path, "r+b") as handle:
-        size = os.fstat(handle.fileno()).st_size
-        pos = last_good = 0
-        pending_moof = False
-        while pos + 8 <= size:
-            handle.seek(pos)
-            header = handle.read(16)
-            box_size, box_type = struct.unpack(">I4s", header[:8])
-            if box_size == 1:
-                if len(header) < 16:
-                    break
-                box_size = struct.unpack(">Q", header[8:16])[0]
-            elif box_size == 0:
-                box_size = size - pos
-            if box_size < 8 or pos + box_size > size:
-                break
-            pos += box_size
-            if box_type == b"moof":
-                pending_moof = True
-            elif box_type == b"mdat":
-                pending_moof = False
-                last_good = pos
-            elif not pending_moof:
-                last_good = pos
-        if last_good < size:
-            handle.truncate(last_good)
-            handle.flush()
-            os.fsync(handle.fileno())
-    return size, last_good
+@dataclass
+class _Stats:
+    frames: int = 0
+    processing_s: float = 0.0
+    last_score: FrameScore | None = None
+    recent: deque = field(default_factory=lambda: deque(maxlen=RECENT_EVENTS))
 
 
-def playable_seconds(path: Path) -> float | None:
-    """Seconds of decodable video according to ffprobe, or None if ffprobe is unavailable."""
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(path)],
-            capture_output=True, text=True, timeout=120, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    times = []
-    for line in result.stdout.splitlines():
-        try:
-            times.append(float(line.strip().rstrip(",")))
-        except ValueError:
-            continue
-    return max(times) - min(times) if len(times) > 1 else 0.0
+class MotionDetector:
+    """Background thread that reads the lores stream of a running Picamera2 instance."""
 
-
-class StorageManager:
-    def __init__(self, settings: Settings, current_segment: Callable[[], Path | None]) -> None:
-        s = settings.storage
-        self.root = settings.recordings_dir
-        self._required_mount = Path(s.required_mount) if s.required_mount else None
-        self._max_bytes = int(s.max_storage_gb * GB)
-        self._min_free_bytes = int(s.min_free_gb * GB)
-        self._max_age_days = s.max_age_days
-        self._current_segment = current_segment
+    def __init__(self, picam2, settings: MotionSettings,
+                 listeners: list[Callable[[str, MotionEvent], None]] | None = None) -> None:
+        self._picam2 = picam2
+        self._settings = settings
+        self._listeners = listeners or []
+        self._analyzer = MotionAnalyzer(settings)
+        self._tracker = MotionEventTracker(settings.trigger_frames, settings.cooldown_seconds,
+                                           self._started, self._ended)
+        self._stats = _Stats()
         self._lock = threading.Lock()
-        self._wake = threading.Event()
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="storage-manager", daemon=True)
-        self._writable = True
-        self._last_usage_log = 0.0
-        self._warned_capacity = False
-        self._ffprobe_warned = False
-        self.status: StorageStatus | None = None
+        self._thread = threading.Thread(target=self._run, name="motion-detector", daemon=True)
 
-    def location_error(self) -> str | None:
-        """Why recordings must not be written right now (e.g. the SSD is not mounted), or None."""
-        if self._required_mount is not None and not os.path.ismount(self._required_mount):
-            return f"{self._required_mount} is not mounted; refusing to record onto the SD card"
-        return None
+    @property
+    def active(self) -> bool:
+        return self._tracker.current is not None
 
-    def can_write(self) -> bool:
-        return self._writable
+    @property
+    def average_processing_ms(self) -> float:
+        s = self._stats
+        return s.processing_s / s.frames * 1000 if s.frames else 0.0
 
-    def trigger(self) -> None:
-        self._wake.set()
+    def events_between(self, start: float, end: float) -> list[MotionEvent]:
+        """Events (finished or ongoing) that overlap [start, end]."""
+        with self._lock:
+            events = list(self._stats.recent)
+        now = time.time()
+        return [e for e in events if e.start <= end and (e.end if e.end is not None else now) >= start]
 
     def start(self) -> None:
+        log.info("Motion detection on: sensitivity %d (pixel threshold %d), min area %.2f%%, "
+                 "cooldown %g s, %g analysed frames/s", self._settings.sensitivity,
+                 self._analyzer.threshold, self._settings.min_area_percent,
+                 self._settings.cooldown_seconds, self._settings.analysis_fps)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
-        self._wake.set()
         if self._thread.is_alive():
-            self._thread.join(timeout=30)
+            self._thread.join(timeout=CAPTURE_TIMEOUT_S + 3)
+        self._tracker.flush()
 
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            self._wake.wait(CHECK_INTERVAL_S)
-            self._wake.clear()
-            if self._stop.is_set():
-                return
-            try:
-                self.run_cycle()
-            except Exception:  # noqa: BLE001 - never let the storage thread die
-                log.exception("Storage check failed")
-
-    def run_cycle(self) -> StorageStatus:
+    def _started(self, event: MotionEvent) -> None:
         with self._lock:
-            problem = self.location_error()
-            if problem:
-                return self._set_status("unavailable", problem, [], 0, 0)
-            self.root.mkdir(parents=True, exist_ok=True)
-            current = self._current_segment()
-            files = scan_segments(self.root)
-            if self._recover_partials(files, current):
-                files = scan_segments(self.root)
+            self._stats.recent.append(event)
+        log.info("Motion started (area %.1f%% of the frame)", event.peak_percent)
+        self._notify("start", event)
 
-            disk = shutil.disk_usage(self.root)
-            protected = {current} if current else set()
-            plan = plan_deletions(files, now=time.time(), max_bytes=self._max_bytes,
-                                  min_free_bytes=self._min_free_bytes, free_bytes=disk.free,
-                                  max_age_days=self._max_age_days, protected=protected)
-            if plan:
-                self._delete(plan)
-                files = scan_segments(self.root)
-                disk = shutil.disk_usage(self.root)
-            return self._evaluate(files, disk)
+    def _ended(self, event: MotionEvent) -> None:
+        log.info("Motion ended after %.1f s (peak area %.1f%%)", event.end - event.start, event.peak_percent)
+        self._notify("end", event)
 
-    def _evaluate(self, files: list[SegmentFile], disk) -> StorageStatus:
-        used = sum(f.size for f in files)
-        if not self._warned_capacity and self._max_bytes > used + disk.free - self._min_free_bytes:
-            self._warned_capacity = True
-            log.warning("Maximum storage %.1f GB does not fit on this disk while keeping %.1f GB free "
-                        "(room for about %.1f GB); the free-space limit will apply first",
-                        self._max_bytes / GB, self._min_free_bytes / GB,
-                        max(0, used + disk.free - self._min_free_bytes) / GB)
-
-        critical_below = self._min_free_bytes * CRITICAL_FRACTION
-        resume_above = self._min_free_bytes * RESUME_FRACTION
-        if disk.free < critical_below or (not self._writable and disk.free < resume_above):
-            state = "critical"
-            message = (f"only {disk.free / GB:.2f} GB free and nothing left to delete; "
-                       f"recording is PAUSED until more space is available")
-        elif disk.free < self._min_free_bytes:
-            state = "low"
-            message = (f"only {disk.free / GB:.2f} GB free (minimum {self._min_free_bytes / GB:g} GB); "
-                       f"something other than recordings is filling the disk")
-        elif used > self._max_bytes:
-            state = "low"
-            message = f"recordings use {used / GB:.2f} GB, above the {self._max_bytes / GB:g} GB limit"
-        else:
-            state = "ok"
-            message = "ok"
-        return self._set_status(state, message, files, used, disk.free, disk.total)
-
-    def _set_status(self, state: str, message: str, files: list[SegmentFile], used: int, free: int,
-                    total: int = 0) -> StorageStatus:
-        previous = self.status.state if self.status else None
-        if state != previous:
-            if state == "ok":
-                if previous is not None:
-                    log.info("Storage back to normal")
-            elif state == "low":
-                log.warning("Storage low: %s", message)
-            else:
-                log.error("Storage %s: %s", state, message)
-        self._writable = state in ("ok", "low")
-
-        complete = [f for f in files if not f.partial]
-        self.status = StorageStatus(
-            state=state, message=message, used_bytes=used, free_bytes=free, total_bytes=total,
-            max_bytes=self._max_bytes, min_free_bytes=self._min_free_bytes, segment_count=len(complete),
-            oldest_start=complete[0].start if complete else None,
-            newest_start=complete[-1].start if complete else None)
-
-        now = time.monotonic()
-        if state != "unavailable" and now - self._last_usage_log >= USAGE_LOG_INTERVAL_S:
-            self._last_usage_log = now
-            oldest = (datetime.fromtimestamp(self.status.oldest_start, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                      if self.status.oldest_start else "none")
-            log.info("Storage usage %.2f GB / %g GB, %.1f GB free, %d segments, oldest %s",
-                     used / GB, self._max_bytes / GB, free / GB, len(complete), oldest)
-        return self.status
-
-    def _delete(self, plan: list[tuple[SegmentFile, str]]) -> None:
-        freed = 0
-        deleted = 0
-        touched_days: set[Path] = set()
-        for f, reason in plan:
-            try:
-                f.path.unlink()
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                log.error("Cannot delete %s: %s", f.rel_path, exc.strerror)
-                continue
-            deleted += 1
-            freed += f.size
-            touched_days.add(f.path.parent)
-            if deleted <= MAX_INDIVIDUAL_DELETE_LOGS:
-                log.info("Deleted %s (%.1f MB): %s", f.rel_path, f.size / 1e6, reason)
-        if deleted > MAX_INDIVIDUAL_DELETE_LOGS:
-            log.info("Deleted %d segments in total, freeing %.1f GB", deleted, freed / GB)
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        for day in touched_days:
-            if day.name < today:
-                try:
-                    day.rmdir()
-                except OSError:
-                    pass
-        if touched_days:
-            fsync_directory(self.root)
-
-    def _recover_partials(self, files: list[SegmentFile], current: Path | None) -> bool:
-        changed = False
-        now = time.time()
-        for f in files:
-            if not f.partial or f.path == current or now - f.mtime < PARTIAL_STALE_S:
-                continue
-            changed |= self._recover(f)
-        return changed
-
-    def _recover(self, f: SegmentFile) -> bool:
-        try:
-            old_size, new_size = trim_to_complete_fragments(f.path)
-        except OSError as exc:
-            log.error("Cannot read unfinished segment %s: %s", f.rel_path, exc.strerror)
-            return False
-        seconds = playable_seconds(f.path) if new_size else 0.0
-        if seconds is None:
-            if not self._ffprobe_warned:
-                self._ffprobe_warned = True
-                log.error("ffprobe is not available; cannot check unfinished segments (sudo apt install ffmpeg)")
-            return False
-        if seconds < MIN_PLAYABLE_S:
-            f.path.unlink(missing_ok=True)
-            log.warning("Deleted unfinished segment %s: nothing playable (%.1f MB)", f.rel_path, old_size / 1e6)
-            return True
-        recovered = f.path.with_name(f.path.name[: -len(PARTIAL_SUFFIX)] + RECOVERED_SUFFIX)
-        os.replace(f.path, recovered)
-        fsync_directory(recovered.parent)
-        trimmed = old_size - new_size
-        log.warning("Recovered unfinished segment %s -> %s: %.1f s playable%s", f.rel_path, recovered.name,
-                    seconds, f", removed {trimmed / 1024:.0f} KiB of incomplete data" if trimmed else "")
-        return True
-EOF
-```
-
-```bash
-cat > ~/surveillance/app/recorder.py <<'EOF'
-"""Continuous recording into wall-clock-aligned, keyframe-split fragmented MP4 segments.
-
-Files are named in UTC:  <recordings_dir>/YYYY-MM-DD/HH-MM-SSZ.mp4
-While a segment is being written it is called  HH-MM-SSZ.mp4.partial ; it is renamed to .mp4
-only after it has been closed and flushed to disk, so a ".mp4" file is always complete.
-"""
-from __future__ import annotations
-
-import logging
-import math
-import os
-import queue
-import threading
-import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Callable
-
-# PyavOutput imports av lazily on first use, which would happen inside the encoder thread when the
-# first segment opens; on a Pi 4 that import takes long enough to drop frames.
-import av  # noqa: F401
-from picamera2.encoders import H264Encoder
-from picamera2.outputs import Output, PyavOutput
-
-from app.camera import Camera
-from app.clock import ClockMonitor
-from app.config import Settings
-from app.fileutil import fsync_directory, fsync_file
-
-log = logging.getLogger("Recorder")
-
-FRAGMENTED_MOVFLAGS = "frag_keyframe+empty_moov+default_base_moof"
-PARTIAL_SUFFIX = ".partial"
-NO_FRAMES_TIMEOUT_S = 10.0
-STARTUP_TIMEOUT_S = 15.0
-OPEN_RETRY_S = 10.0
-
-
-@dataclass(frozen=True)
-class Segment:
-    """A completed recording segment."""
-    path: Path
-    rel_path: str
-    start_utc: datetime
-    end_utc: datetime
-    duration_s: float
-    size_bytes: int
-    frames: int
-    clock_synced: bool | None
-
-
-class _OpenSegment:
-    def __init__(self, final_path: Path, output: PyavOutput, start_wall: float, first_ts: int,
-                 boundary: float, clock_synced: bool | None) -> None:
-        self.final_path = final_path
-        self.partial_path = final_path.with_name(final_path.name + PARTIAL_SUFFIX)
-        self.output = output
-        self.start_wall = start_wall
-        self.first_ts = first_ts
-        self.last_ts = first_ts
-        self.boundary = boundary
-        self.clock_synced = clock_synced
-        self.frames = 0
-        self.error: str | None = None
-
-
-class SegmentingOutput(Output):
-    """Picamera2 output that starts a new file at the first keyframe after each segment boundary.
-
-    outputframe() runs in Picamera2's encoder thread, so it never waits for the disk: closed
-    segments are handed to `on_closed`, which fsyncs and renames them in another thread.
-    """
-
-    def __init__(self, recordings_dir: Path, segment_seconds: int, framerate: float,
-                 keyframe_seconds: float, clock: ClockMonitor,
-                 on_closed: Callable[[_OpenSegment], None], can_write: Callable[[], bool]) -> None:
-        super().__init__()
-        self._can_write = can_write
-        self.paused = False
-        self.needs_add_stream = True
-        self._streams: list[tuple] = []
-        self._dir = recordings_dir
-        self._segment_seconds = segment_seconds
-        self._frame_interval_us = 1_000_000 / framerate
-        # A clock jump backwards must not produce one enormous segment.
-        self._max_duration_us = (segment_seconds + 3 * keyframe_seconds) * 1_000_000
-        self._align_tolerance_s = keyframe_seconds + 3.0
-        self._clock = clock
-        self._on_closed = on_closed
-        self._lock = threading.Lock()
-        self._current: _OpenSegment | None = None
-        self._retry_open_at = 0.0
-        self.last_frame_monotonic: float | None = None
-        self.write_error: str | None = None
-        self.write_error_since: float | None = None
-
-    @property
-    def current_rel_path(self) -> str | None:
-        seg = self._current
-        return str(seg.final_path.relative_to(self._dir)) if seg else None
-
-    @property
-    def current_partial_path(self) -> Path | None:
-        seg = self._current
-        return seg.partial_path if seg else None
-
-    def _add_stream(self, encoder_stream, codec_name, **kwargs) -> None:
-        self._streams.append((encoder_stream, codec_name, kwargs))
-
-    def stop(self) -> None:
-        with self._lock:
-            super().stop()
-            self._close_current()
-
-    def outputframe(self, frame, keyframe=True, timestamp=None, packet=None, audio=False) -> None:
-        if audio:
-            return
-        with self._lock:
-            if not self.recording:
-                return
-            self.last_frame_monotonic = time.monotonic()
-            if timestamp is None:
-                timestamp = int(self.last_frame_monotonic * 1_000_000)
-            seg = self._current
-            if keyframe and not self._can_write():
-                if not self.paused:
-                    log.error("Recording paused: storage is critically full")
-                    self.paused = True
-                self._close_current()
-                return
-            if keyframe and self.paused:
-                log.info("Recording resumed: storage space is available again")
-                self.paused = False
-            if keyframe and self._should_rotate(seg, timestamp):
-                self._close_current()
-                seg = self._open(timestamp)
-            if seg is None:
-                return
-            seg.output.outputframe(frame, keyframe, timestamp - seg.first_ts, packet, audio)
-            seg.last_ts = timestamp
-            seg.frames += 1
-
-    def _should_rotate(self, seg: _OpenSegment | None, timestamp: int) -> bool:
-        if seg is None:
-            return time.monotonic() >= self._retry_open_at
-        return (seg.error is not None
-                or time.time() >= seg.boundary
-                or timestamp - seg.first_ts >= self._max_duration_us)
-
-    def _open(self, timestamp: int) -> _OpenSegment | None:
-        now = time.time()
-        slot_start = math.floor(now / self._segment_seconds) * self._segment_seconds
-        # Name aligned segments after their boundary (e.g. 13-05-00Z) even though the first
-        # keyframe arrives up to one keyframe interval later; the true start is in the metadata.
-        nominal = slot_start if now - slot_start <= self._align_tolerance_s else now
-        final_path = self._unique_path(datetime.fromtimestamp(nominal, timezone.utc))
-        seg = None
-        try:
-            final_path.parent.mkdir(parents=True, exist_ok=True)
-            output = PyavOutput(str(final_path) + PARTIAL_SUFFIX, format="mp4",
-                                options={"movflags": FRAGMENTED_MOVFLAGS})
-            seg = _OpenSegment(final_path, output, now, timestamp, slot_start + self._segment_seconds,
-                               self._clock.synchronized)
-            output.error_callback = lambda exc, s=seg: setattr(s, "error", f"{type(exc).__name__}: {exc}")
-            output.start()
-            for encoder_stream, codec_name, kwargs in self._streams:
-                output._add_stream(encoder_stream, codec_name, **kwargs)
-        except Exception as exc:  # noqa: BLE001 - must never kill the encoder thread
-            if seg is not None:
-                try:
-                    seg.output.stop()
-                except Exception:  # noqa: BLE001
-                    pass
-            self._retry_open_at = time.monotonic() + OPEN_RETRY_S
-            message = f"{type(exc).__name__}: {exc}"
-            if self.write_error is None:
-                self.write_error_since = time.monotonic()
-                log.error("Cannot create segment %s: %s (retrying every %.0f s)",
-                          final_path.name, message, OPEN_RETRY_S)
-            self.write_error = message
-            return None
-        if self.write_error is not None:
-            log.info("Segment writing recovered after error: %s", self.write_error)
-        self.write_error = None
-        self.write_error_since = None
-        self._current = seg
-        log.debug("Opened segment %s", final_path.relative_to(self._dir))
-        return seg
-
-    def _unique_path(self, start: datetime) -> Path:
-        day_dir = self._dir / start.strftime("%Y-%m-%d")
-        base = start.strftime("%H-%M-%SZ")
-        candidate = day_dir / f"{base}.mp4"
-        counter = 1
-        while candidate.exists() or candidate.with_name(candidate.name + PARTIAL_SUFFIX).exists():
-            candidate = day_dir / f"{base}-{counter}.mp4"
-            counter += 1
-        return candidate
-
-    def _close_current(self) -> None:
-        seg, self._current = self._current, None
-        if seg is None:
-            return
-        try:
-            seg.output.stop()
-        except Exception as exc:  # noqa: BLE001
-            seg.error = seg.error or f"{type(exc).__name__}: {exc}"
-        self._on_closed(seg)
-
-    def segment_metadata(self, seg: _OpenSegment, size_bytes: int) -> Segment:
-        duration_s = ((seg.last_ts - seg.first_ts) + self._frame_interval_us) / 1_000_000
-        start = datetime.fromtimestamp(seg.start_wall, timezone.utc)
-        end = datetime.fromtimestamp(seg.start_wall + duration_s, timezone.utc)
-        return Segment(path=seg.final_path, rel_path=str(seg.final_path.relative_to(self._dir)),
-                       start_utc=start, end_utc=end, duration_s=round(duration_s, 3),
-                       size_bytes=size_bytes, frames=seg.frames, clock_synced=seg.clock_synced)
-
-
-class Recorder:
-    """Owns the camera, the hardware H.264 encoder and the segment files."""
-
-    def __init__(self, settings: Settings, clock: ClockMonitor,
-                 can_write: Callable[[], bool] = lambda: True,
-                 location_error: Callable[[], str | None] = lambda: None) -> None:
-        self.settings = settings
-        self.recordings_dir = settings.recordings_dir
-        self._clock = clock
-        self._can_write = can_write
-        self._location_error = location_error
-        self._camera: Camera | None = None
-        self._output: SegmentingOutput | None = None
-        self._recording = False
-        self._started_monotonic = 0.0
-        self._finalize_queue: queue.Queue[_OpenSegment | None] = queue.Queue()
-        self._finalizer = threading.Thread(target=self._finalize_loop, name="segment-finalizer", daemon=True)
-        self._boundary_stop = threading.Event()
-        self._boundary_thread: threading.Thread | None = None
-        self._listeners: list[Callable[[Segment], None]] = []
-        self.last_segment: Segment | None = None
-
-    def add_listener(self, callback: Callable[[Segment], None]) -> None:
-        self._listeners.append(callback)
-
-    @property
-    def current_segment(self) -> str | None:
-        return self._output.current_rel_path if self._output else None
-
-    @property
-    def current_partial_path(self) -> Path | None:
-        return self._output.current_partial_path if self._output else None
-
-    def start(self) -> None:
-        cam = self.settings.camera
-        problem = self._location_error()
-        if problem:
-            raise OSError(problem)
-        self.recordings_dir.mkdir(parents=True, exist_ok=True)
-        if not os.access(self.recordings_dir, os.W_OK):
-            raise PermissionError(f"recordings directory is not writable: {self.recordings_dir}")
-        self._finalizer.start()
-
-        self._camera = Camera(cam)
-        self._camera.open()
-        encoder = H264Encoder(bitrate=cam.bitrate, iperiod=cam.keyframe_interval_frames,
-                              framerate=cam.framerate, profile="high", repeat=True)
-        self._output = SegmentingOutput(self.recordings_dir, self.settings.recording.segment_seconds,
-                                        cam.framerate, cam.keyframe_seconds, self._clock,
-                                        self._finalize_queue.put, self._can_write)
-        self._camera.picam2.start_recording(encoder, self._output)
-        self._recording = True
-        self._started_monotonic = time.monotonic()
-        self._boundary_thread = threading.Thread(target=self._boundary_loop, args=(encoder,),
-                                                 name="segment-boundaries", daemon=True)
-        self._boundary_thread.start()
-        log.info("Started recording to %s (%d s segments, %.2f Mbit/s, keyframe every %g s)",
-                 self.recordings_dir, self.settings.recording.segment_seconds, cam.bitrate / 1e6,
-                 cam.keyframe_seconds)
-
-    def stop(self) -> None:
-        was_recording = self._recording
-        self._boundary_stop.set()
-        if self._boundary_thread is not None and self._boundary_thread.is_alive():
-            self._boundary_thread.join(timeout=5)
-        if self._camera is not None and self._camera.picam2 is not None:
-            if self._recording:
-                try:
-                    self._camera.picam2.stop_recording()
-                except Exception as exc:  # noqa: BLE001
-                    log.error("Error while stopping the encoder: %s", exc)
-                    if self._output is not None:
-                        self._output.stop()
-            self._camera.close()
-        self._camera = None
-        self._recording = False
-        if self._finalizer.is_alive():
-            self._finalize_queue.put(None)
-            self._finalizer.join(timeout=60)
-        if was_recording:
-            log.info("Stopped recording")
-
-    def health(self) -> str | None:
-        """Return a description of the problem, or None if frames are flowing and being written."""
-        if not self._recording or self._output is None:
-            return "not recording"
-        now = time.monotonic()
-        last = self._output.last_frame_monotonic
-        if last is None:
-            if now - self._started_monotonic > STARTUP_TIMEOUT_S:
-                return f"no frames received {STARTUP_TIMEOUT_S:.0f} s after start"
-        elif now - last > NO_FRAMES_TIMEOUT_S:
-            return f"no frames for {now - last:.0f} s"
-        return None
-
-    @property
-    def write_error(self) -> str | None:
-        return self._output.write_error if self._output else None
-
-    def _boundary_loop(self, encoder: H264Encoder) -> None:
-        """Request a keyframe at each boundary so segments start on time, not up to 2 s late."""
-        segment_seconds = self.settings.recording.segment_seconds
-        while True:
-            now = time.time()
-            next_boundary = (math.floor(now / segment_seconds) + 1) * segment_seconds
-            if self._boundary_stop.wait(next_boundary - now):
-                return
-            try:
-                encoder.force_key_frame()
-            except Exception as exc:  # noqa: BLE001 - regular keyframes still split the segment
-                log.debug("Could not force a keyframe: %s", exc)
-
-    def _finalize_loop(self) -> None:
-        while True:
-            seg = self._finalize_queue.get()
-            if seg is None:
-                return
-            try:
-                self._finalize(seg)
-            except Exception:  # noqa: BLE001 - one bad segment must not stop finalisation
-                log.exception("Failed to finalise segment %s", seg.partial_path)
-
-    def _finalize(self, seg: _OpenSegment) -> None:
-        partial = seg.partial_path
-        if not partial.exists():
-            log.error("Segment file vanished before it was finalised: %s", partial)
-            return
-        if seg.frames == 0:
-            partial.unlink(missing_ok=True)
-            return
-        fsync_file(partial)
-        if seg.error:
-            log.error("Segment %s had a write error (%s); left as .partial for recovery",
-                      partial.name, seg.error)
-            return
-        os.replace(partial, seg.final_path)
-        fsync_directory(seg.final_path.parent)
-        segment = self._output.segment_metadata(seg, seg.final_path.stat().st_size)
-        self.last_segment = segment
-        log.info("Segment completed: %s start=%s duration=%.1fs frames=%d size=%.1fMB%s",
-                 segment.rel_path, segment.start_utc.isoformat(timespec="milliseconds"),
-                 segment.duration_s, segment.frames, segment.size_bytes / 1e6,
-                 {True: "", False: " (clock NOT synchronised)"}.get(segment.clock_synced,
-                                                                     " (clock sync unknown)"))
+    def _notify(self, kind: str, event: MotionEvent) -> None:
         for callback in self._listeners:
             try:
-                callback(segment)
+                callback(kind, event)
             except Exception:  # noqa: BLE001
-                log.exception("Segment listener failed")
-EOF
-```
+                log.exception("Motion listener failed")
 
-```bash
-cat > ~/surveillance/app/main.py <<'EOF'
-"""Recorder service entry point.
-
-Run from the project directory:   python3 -m app.main [--config PATH]
-
-Supervises the recording pipeline: if the camera cannot be opened, or frames stop arriving,
-the pipeline is torn down and restarted with exponential backoff (5 s up to 60 s).
-SIGTERM/SIGINT (Ctrl+C) stop cleanly and finalise the current segment.
-"""
-from __future__ import annotations
-
-import os
-
-# libcamera reads this when it is first loaded, so it must be set before app.recorder is imported.
-os.environ.setdefault("LIBCAMERA_LOG_LEVELS", "*:WARN")
-
-import argparse  # noqa: E402
-import logging  # noqa: E402
-import signal  # noqa: E402
-import sys  # noqa: E402
-import threading  # noqa: E402
-import time  # noqa: E402
-from pathlib import Path  # noqa: E402
-
-from app import __version__  # noqa: E402
-from app.camera import CameraError  # noqa: E402
-from app.clock import ClockMonitor  # noqa: E402
-from app.config import DEFAULT_CONFIG_PATH, ConfigError, Settings, load_settings  # noqa: E402
-from app.logging_setup import setup_logging  # noqa: E402
-from app.recorder import Recorder  # noqa: E402
-from app.storage_manager import StorageManager  # noqa: E402
-
-log = logging.getLogger("Main")
-
-BACKOFF_INITIAL_S = 5
-BACKOFF_MAX_S = 60
-HEALTHY_RESET_S = 120
-
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Raspberry Pi surveillance recorder")
-    parser.add_argument("--config", type=Path,
-                        default=Path(os.environ.get("SURVEILLANCE_CONFIG", DEFAULT_CONFIG_PATH)),
-                        help=f"settings file (default {DEFAULT_CONFIG_PATH})")
-    return parser.parse_args(argv)
-
-
-def run(settings: Settings, stop: threading.Event) -> None:
-    clock = ClockMonitor()
-    clock.start()
-    active: list[Recorder] = []
-    storage = StorageManager(settings, lambda: active[0].current_partial_path if active else None)
-    # Recover unfinished segments and free space before the camera starts writing.
-    try:
-        storage.run_cycle()
-    except Exception:  # noqa: BLE001 - the periodic check retries; recording matters more
-        log.exception("Initial storage check failed")
-    storage.start()
-    backoff = BACKOFF_INITIAL_S
-    try:
-        while not stop.is_set():
-            recorder = Recorder(settings, clock, storage.can_write, storage.location_error)
-            recorder.add_listener(lambda _segment: storage.trigger())
-            active[:] = [recorder]
+    def _run(self) -> None:
+        stream = self._picam2.stream_configuration("lores")
+        width, height = stream["size"]
+        stride = stream["stride"]
+        step = max(1, width // ANALYSIS_WIDTH)
+        interval = 1.0 / self._settings.analysis_fps
+        next_due = time.monotonic()
+        while not self._stop.is_set():
             try:
-                recorder.start()
-            except (CameraError, OSError) as exc:
-                log.error("Could not start recording: %s. Retrying in %d s", exc, backoff)
-                recorder.stop()
-                stop.wait(backoff)
-                backoff = min(backoff * 2, BACKOFF_MAX_S)
+                buffer = self._picam2.capture_buffer("lores", wait=CAPTURE_TIMEOUT_S)
+            except TimeoutError:
+                continue  # the recorder's health check handles a stalled camera
+            except Exception as exc:  # noqa: BLE001
+                if self._stop.is_set():
+                    return
+                log.error("Cannot read the low-resolution stream: %s", exc)
+                self._stop.wait(1.0)
                 continue
+            now = time.time()
+            # YUV420: the first stride*height bytes are the Y (greyscale) plane.
+            gray = np.ascontiguousarray(buffer[: stride * height].reshape(height, stride)[::step, :width:step])
+            started = time.perf_counter()
+            score = self._analyzer.analyze(gray, now)
+            self._tracker.update(score.moving, score.largest_percent, now)
+            self._stats.processing_s += time.perf_counter() - started
+            self._stats.frames += 1
+            self._stats.last_score = score
+            if score.lighting_change:
+                log.debug("Lighting change (%.0f%% of pixels changed); background relearned", score.total_percent)
 
-            started = time.monotonic()
-            while not stop.wait(1.0):
-                problem = recorder.health()
-                if problem:
-                    log.error("Recording unhealthy: %s. Restarting the camera pipeline", problem)
-                    break
-                if time.monotonic() - started > HEALTHY_RESET_S:
-                    backoff = BACKOFF_INITIAL_S
-            recorder.stop()
-            if not stop.is_set():
-                stop.wait(backoff)
-                backoff = min(backoff * 2, BACKOFF_MAX_S)
-    finally:
-        active.clear()
-        storage.stop()
-        clock.stop()
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    try:
-        settings, created = load_settings(args.config)
-    except ConfigError as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
-        return 2
-
-    log_file = setup_logging(settings.logging, settings.log_dir)
-    log.info("Surveillance recorder %s starting (config %s%s, log %s)", __version__, args.config,
-             ", created with defaults" if created else "", log_file or "console only")
-
-    stop = threading.Event()
-
-    def request_stop(signum, _frame) -> None:
-        if not stop.is_set():
-            log.info("Received %s, stopping", signal.Signals(signum).name)
-        stop.set()
-
-    signal.signal(signal.SIGTERM, request_stop)
-    signal.signal(signal.SIGINT, request_stop)
-
-    try:
-        run(settings, stop)
-    except Exception:  # noqa: BLE001 - log it; systemd restarts the service
-        log.exception("Fatal error")
-        return 1
-    log.info("Surveillance recorder stopped")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+            next_due += interval
+            delay = next_due - time.monotonic()
+            if delay > 0:
+                self._stop.wait(delay)
+            else:
+                next_due = time.monotonic()
 EOF
 ```
 
+**3. The tuning tool:**
+
 ```bash
-cat > ~/surveillance/tools/phase5_storage_report.py <<'EOF'
+cat > ~/surveillance/tools/phase6_motion_tune.py <<'EOF'
 #!/usr/bin/env python3
-"""Phase 5: read-only storage report. Changes nothing on disk.
+"""Phase 6: watch live motion scores to tune sensitivity and minimum area.
 
-    python3 ~/surveillance/tools/phase5_storage_report.py [--max-gb N] [--min-free-gb N]
+Stop the recorder first (only one program can use the camera), then run:
 
-Shows where recordings are stored, how much space they use, the configured limits, the
-average bitrate, how many hours of history the limit holds, and which segments the storage
-manager would delete right now (or with the limits given on the command line).
+    python3 ~/surveillance/tools/phase6_motion_tune.py [--seconds 60] [--sensitivity N]
+                                                      [--min-area PERCENT] [--save-every 5]
+
+Once per second it prints the largest moving region (% of the frame) and whether that
+counts as motion. At the end it reports the noise level of a quiet scene, so you can check
+that min_area_percent sits safely above it. --save-every writes side-by-side images
+(camera view | changed pixels) to ~/surveillance/snapshots/phase6/.
 """
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
-import shutil
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
+os.environ.setdefault("LIBCAMERA_LOG_LEVELS", "*:WARN")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import cv2  # noqa: E402
+import numpy as np  # noqa: E402
+
+from app.camera import Camera, CameraError  # noqa: E402
 from app.config import DEFAULT_CONFIG_PATH, ConfigError, load_settings  # noqa: E402
-from app.storage_manager import (GB, RECOVERED_SUFFIX, plan_deletions,  # noqa: E402
-                                 scan_segments)
+from app.motion_detector import ANALYSIS_WIDTH, MotionAnalyzer, MotionEventTracker  # noqa: E402
 
-BITRATE_SAMPLE_SEGMENTS = 12
-
-
-def mount_point(path: Path) -> Path:
-    path = path.resolve()
-    while not os.path.ismount(path):
-        path = path.parent
-    return path
+SNAPSHOT_DIR = Path(__file__).resolve().parent.parent / "snapshots" / "phase6"
+BAR_WIDTH = 30
 
 
-def mount_device(mount: Path) -> str:
-    try:
-        for line in Path("/proc/mounts").read_text().splitlines():
-            device, where, fstype, *_ = line.split()
-            if where == str(mount):
-                return f"{device} ({fstype})"
-    except OSError:
-        pass
-    return "unknown device"
+def bar(percent: float, scale: float) -> str:
+    filled = min(BAR_WIDTH, int(percent / scale * BAR_WIDTH)) if scale else 0
+    return "#" * filled + "." * (BAR_WIDTH - filled)
 
 
-def fmt_time(epoch: float | None) -> str:
-    if epoch is None:
-        return "none"
-    utc = datetime.fromtimestamp(epoch, timezone.utc)
-    local = utc.astimezone()
-    return f"{utc:%Y-%m-%d %H:%M} UTC ({local:%Y-%m-%d %H:%M} local)"
+def percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(len(ordered) * pct / 100))]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Phase 5: storage report (read-only)")
+    parser = argparse.ArgumentParser(description="Phase 6: motion tuning")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--max-gb", type=float, help="simulate a different storage.max_storage_gb")
-    parser.add_argument("--min-free-gb", type=float, help="simulate a different storage.min_free_gb")
+    parser.add_argument("--seconds", type=int, default=60)
+    parser.add_argument("--sensitivity", type=int, help="override motion.sensitivity (1-100)")
+    parser.add_argument("--min-area", type=float, help="override motion.min_area_percent")
+    parser.add_argument("--save-every", type=float, default=0, help="save a debug image every N seconds")
     args = parser.parse_args()
+    if os.geteuid() == 0:
+        print("Do not run this as root.", file=sys.stderr)
+        return 2
+
     try:
         settings, _ = load_settings(args.config, create_if_missing=False)
+        motion = settings.motion
+        if args.sensitivity is not None:
+            motion = dataclasses.replace(motion, sensitivity=args.sensitivity)
+        if args.min_area is not None:
+            motion = dataclasses.replace(motion, min_area_percent=args.min_area)
+        motion.validate()
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
 
-    s = settings.storage
-    root = settings.recordings_dir
-    max_gb = args.max_gb if args.max_gb is not None else s.max_storage_gb
-    min_free_gb = args.min_free_gb if args.min_free_gb is not None else s.min_free_gb
-    if not root.is_dir():
-        print(f"Recordings folder {root} does not exist yet.")
+    camera = Camera(settings.camera)
+    try:
+        camera.open()
+    except CameraError as exc:
+        print(f"{exc}\nIs the recorder still running? Stop it first (Ctrl+C in its window).", file=sys.stderr)
         return 1
 
-    files = scan_segments(root)
-    complete = [f for f in files if not f.partial]
-    partials = [f for f in files if f.partial]
-    recovered = [f for f in complete if f.path.name.endswith(RECOVERED_SUFFIX)]
-    used = sum(f.size for f in files)
-    disk = shutil.disk_usage(root)
-    mount = mount_point(root)
-    seg_len = settings.recording.segment_seconds
+    analyzer = MotionAnalyzer(motion)
+    events: list[tuple[float, float, float]] = []
+    tracker = MotionEventTracker(
+        motion.trigger_frames, motion.cooldown_seconds,
+        on_start=lambda e: print(f"  >>> MOTION STARTED (area {e.peak_percent:.1f}%)", flush=True),
+        on_end=lambda e: (events.append((e.start, e.end, e.peak_percent)),
+                          print(f"  <<< motion ended after {e.end - e.start:.1f} s "
+                                f"(peak {e.peak_percent:.1f}%)", flush=True)))
+    if args.save_every:
+        SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"Recordings folder : {root}")
-    print(f"Stored on         : {mount_device(mount)}, mounted at {mount}")
-    print(f"Disk              : {disk.total / GB:.1f} GB total, {disk.free / GB:.1f} GB free")
-    print(f"Limits            : max {max_gb:g} GB, keep {min_free_gb:g} GB free, max age "
-          f"{f'{s.max_age_days} days' if s.max_age_days else 'off'}, required mount "
-          f"{s.required_mount or 'none'}" + ("   (simulated)" if args.max_gb or args.min_free_gb else ""))
-    print(f"Recordings        : {used / GB:.2f} GB in {len(complete)} segments "
-          f"({len(recovered)} recovered, {len(partials)} unfinished)")
-    print(f"Oldest / newest   : {fmt_time(complete[0].start if complete else None)} / "
-          f"{fmt_time(complete[-1].start if complete else None)}")
+    print(f"Sensitivity {motion.sensitivity} (pixel threshold {analyzer.threshold}), "
+          f"min area {motion.min_area_percent:g}%, trigger {motion.trigger_frames} frames, "
+          f"cooldown {motion.cooldown_seconds:g} s, {motion.analysis_fps:g} frames/s. "
+          f"Running {args.seconds} s; Ctrl+C stops.\n")
+    quiet_scores: list[float] = []
+    processing: list[float] = []
+    picam2 = camera.picam2
+    try:
+        picam2.start()
+        stream = picam2.stream_configuration("lores")
+        width, height = stream["size"]
+        stride = stream["stride"]
+        step = max(1, width // ANALYSIS_WIDTH)
+        interval = 1.0 / motion.analysis_fps
+        end_at = time.monotonic() + args.seconds
+        next_print = next_save = time.monotonic()
+        second_max = 0.0
+        while time.monotonic() < end_at:
+            loop_start = time.monotonic()
+            buffer = picam2.capture_buffer("lores", wait=2.0)
+            now = time.time()
+            gray = np.ascontiguousarray(buffer[: stride * height].reshape(height, stride)[::step, :width:step])
+            t0 = time.perf_counter()
+            score = analyzer.analyze(gray, now)
+            tracker.update(score.moving, score.largest_percent, now)
+            processing.append((time.perf_counter() - t0) * 1000)
+            second_max = max(second_max, score.largest_percent)
+            if tracker.current is None and not score.moving:
+                quiet_scores.append(score.largest_percent)
 
-    full = [f for f in complete if f.start % seg_len == 0 and not f.path.name.endswith(RECOVERED_SUFFIX)]
-    sample = full[-BITRATE_SAMPLE_SEGMENTS - 1:-1] or full[-BITRATE_SAMPLE_SEGMENTS:]
-    if sample:
-        bytes_per_s = sum(f.size for f in sample) / (len(sample) * seg_len)
-        capacity = min(max_gb * GB, used + disk.free - min_free_gb * GB)
-        hours = capacity / bytes_per_s / 3600 if bytes_per_s else 0
-        print(f"Average bitrate   : {bytes_per_s * 8 / 1e6:.2f} Mbit/s (last {len(sample)} full segments)")
-        print(f"Estimated history : {capacity / GB:.2f} GB usable = about {hours:.1f} h ({hours / 24:.1f} days)")
+            if loop_start >= next_print:
+                state = "MOTION" if tracker.current else ("moving" if score.moving else "quiet")
+                light = "  (lighting change ignored)" if score.lighting_change else ""
+                print(f"{time.strftime('%H:%M:%S')}  largest {second_max:5.2f}%  "
+                      f"[{bar(second_max, motion.min_area_percent * 4)}]  {state}{light}", flush=True)
+                second_max = 0.0
+                next_print = loop_start + 1.0
+            if args.save_every and analyzer.last_mask is not None and loop_start >= next_save:
+                side = np.hstack([gray, analyzer.last_mask])
+                path = SNAPSHOT_DIR / f"{time.strftime('%H%M%S')}_motion.png"
+                cv2.imwrite(str(path), side)
+                next_save = loop_start + args.save_every
+            delay = interval - (time.monotonic() - loop_start)
+            if delay > 0:
+                time.sleep(delay)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        tracker.flush()
+        camera.close()
+
+    noise = percentile(quiet_scores, 99)
+    print("\n=== Summary ===")
+    print(f"Frames analysed      : {len(processing)}, average {np.mean(processing) if processing else 0:.1f} ms "
+          f"per frame (max {max(processing) if processing else 0:.1f} ms)")
+    print(f"Events               : {len(events)}")
+    print(f"Quiet-scene noise    : 99% of quiet frames had a largest region below {noise:.2f}%")
+    if noise and motion.min_area_percent < 2 * noise:
+        print(f"Advice               : min_area_percent {motion.min_area_percent:g} is close to the noise level; "
+              f"try {max(2 * noise, 0.1):.2f} or a lower sensitivity")
     else:
-        print("Average bitrate   : not enough full-length segments yet")
-
-    plan = plan_deletions(files, now=time.time(), max_bytes=int(max_gb * GB),
-                          min_free_bytes=int(min_free_gb * GB), free_bytes=disk.free,
-                          max_age_days=s.max_age_days, protected=set())
-    print(f"Would delete now  : {len(plan)} segment(s)")
-    for f, reason in plan[:10]:
-        print(f"    {f.rel_path} ({f.size / 1e6:.1f} MB): {reason}")
-    if len(plan) > 10:
-        print(f"    ... and {len(plan) - 10} more")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-EOF
-```
-
-```bash
-cat > ~/surveillance/tools/set_setting.py <<'EOF'
-#!/usr/bin/env python3
-"""Change one setting safely (validated, atomic write).
-
-    python3 ~/surveillance/tools/set_setting.py storage.max_storage_gb 45
-    python3 ~/surveillance/tools/set_setting.py storage.required_mount /mnt/cctv
-    python3 ~/surveillance/tools/set_setting.py --show
-
-Values are parsed as JSON when possible (numbers, true/false), otherwise used as text.
-Restart the recorder afterwards for the change to take effect.
-"""
-from __future__ import annotations
-
-import argparse
-import json
-import sys
-from dataclasses import asdict
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from app.config import DEFAULT_CONFIG_PATH, ConfigError, load_settings, save_settings, settings_from_dict  # noqa: E402
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Change one setting")
-    parser.add_argument("key", nargs="?", help="section.name, e.g. storage.max_storage_gb")
-    parser.add_argument("value", nargs="?")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--show", action="store_true", help="print all current settings")
-    args = parser.parse_args()
-
-    try:
-        settings, _ = load_settings(args.config)
-    except ConfigError as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
-        return 2
-    data = asdict(settings)
-    if args.show or args.key is None:
-        print(json.dumps(data, indent=2))
-        return 0
-    if args.value is None or args.key.count(".") != 1:
-        parser.error("usage: set_setting.py section.name value")
-
-    section, name = args.key.split(".")
-    if section not in data or name not in data[section]:
-        print(f"Unknown setting: {args.key}", file=sys.stderr)
-        return 2
-    try:
-        value = json.loads(args.value)
-    except json.JSONDecodeError:
-        value = args.value
-    old = data[section][name]
-    data[section][name] = value
-    try:
-        save_settings(settings_from_dict(data), args.config)
-    except ConfigError as exc:
-        print(f"Not saved: {exc}", file=sys.stderr)
-        return 2
-    print(f"{args.key}: {old!r} -> {value!r}  (restart the recorder to apply)")
+        print(f"Advice               : min_area_percent {motion.min_area_percent:g} is comfortably above the noise")
+    if args.save_every:
+        print(f"Debug images         : {SNAPSHOT_DIR}")
     return 0
 
 
@@ -1353,95 +562,111 @@ EOF
 
 ## Test procedure
 
-Run everything as `ysak` from `~/surveillance`. You'll need two SSH windows for test A.
+Run everything as `ysak` from `~/surveillance`.
 
-**0. Add the new storage section to your settings file and look at the report.**
-
-```bash
-cd ~/surveillance
-python3 tools/set_setting.py storage.max_storage_gb 45
-python3 tools/set_setting.py recording.segment_seconds 60
-python3 tools/phase5_storage_report.py
-```
-
-Note the **"GB free"** number on the `Disk` line; test C uses it.
-
-**A. Crash recovery (default limits).** In window 1, run `python3 -m app.main`. After about 90 seconds, kill it from window 2:
+**0. Finish Phase 5: the real critical-storage test, then restore the normal settings.**
 
 ```bash
-pkill -9 -f "^python3 -m app.main"
-```
-
-Start `python3 -m app.main` again in window 1. **Within about 30–90 seconds** you should see a `Recovered unfinished segment …` line. Recovery waits until the file has been untouched for 60 seconds, so it can never grab a file that is still being written. Stop with Ctrl+C.
-
-**B. Size limit.** Set the limit to 0.03 GB, which is about 3 one-minute segments at your bitrate. Run for about 5 minutes:
-
-```bash
-python3 tools/set_setting.py storage.max_storage_gb 0.03
+python3 tools/set_setting.py storage.min_free_gb 120
 python3 -m app.main
 ```
 
-You should see `Deleted … over the 0.03 GB limit` lines. Stop with Ctrl+C, then check:
+Within about 2 s of starting, it should log `Storage critical … PAUSED` and then `Recording paused: storage is critically full`, and no `Segment completed` lines should follow. Leave it for about 30 s, then press Ctrl+C.
+
+Then restore the normal settings. Keep 60-second segments for the rest of this phase:
 
 ```bash
-python3 tools/phase5_storage_report.py      # Recordings should be about 0.03 GB or less
-python3 tools/phase4_check_segments.py      # the remaining segments still pass
-```
-
-**C. Free-space safety and the emergency pause.** This deletes your test recordings. Let **F** be the "GB free" number from step 0 (say 40).
-
-- **Low:** run `python3 tools/set_setting.py storage.min_free_gb 45`, using F + 5. Then run `python3 -m app.main` for about 2 minutes. Expect `Storage low: …` warnings and deletions, **while recording continues**.
-- **Critical:** run `python3 tools/set_setting.py storage.min_free_gb 100`, using any value above 2 × F. Run it again for about 1 minute. Expect `Storage critical: … PAUSED` and `Recording paused: storage is critically full`, and **no new segments**. Stop with Ctrl+C.
-
-**D. Unmounted SSD guard.** Set up a pretend SSD location, try to start, check that nothing was created on the SD card, then undo it in this order:
-
-```bash
-python3 tools/set_setting.py paths.recordings_dir /mnt/cctv/recordings
-python3 tools/set_setting.py storage.required_mount /mnt/cctv
-python3 -m app.main           # should refuse and retry every 5, 10, 20 s; press Ctrl+C
-ls /mnt/cctv                  # should say: No such file or directory
-python3 tools/set_setting.py storage.required_mount '""'
-python3 tools/set_setting.py paths.recordings_dir recordings
-```
-
-**E. Restore the normal settings:**
-
-```bash
-python3 tools/set_setting.py storage.max_storage_gb 45
 python3 tools/set_setting.py storage.min_free_gb 2
-python3 tools/set_setting.py recording.segment_seconds 300
-python3 tools/set_setting.py --show
+python3 tools/set_setting.py storage.max_storage_gb 45
+python3 tools/set_setting.py motion.sensitivity 70      # also writes the new motion section into the file
+```
+
+**1. Tune on your real scene.** The recorder must be stopped for this. Run the tool for 60 s: stay out of view for the first 20 s, walk through the view at about 25 s, then leave again.
+
+```bash
+python3 tools/phase6_motion_tune.py --seconds 60 --save-every 5
+```
+
+**2. Look at the debug images on your laptop** (run this on the laptop). In each image, the left half is what the detector sees and the right half is the changed pixels. You should see only yourself in white, not flickering noise.
+
+```bash
+scp 'ysak@ysak.local:~/surveillance/snapshots/phase6/*.png' .
+```
+
+**3. Test room-light changes.** Rerun the tool for 30 s and switch the room light off and on. Expect `(lighting change ignored)`, not `MOTION STARTED`. With your camera's slow auto-exposure, this may show up as a short event instead. Tell me if it does.
+
+**4. Run with the recorder** for about 4 minutes, walking through the view once around the middle:
+
+```bash
+python3 -m app.main
+```
+
+**5. Measure CPU while it records** (in a second window):
+
+```bash
+top -b -n 3 -d 5 -p "$(pgrep -f '^python3 -m app.main')" | grep python3
 ```
 
 ## Expected output
 
-For test A, after the restart:
+The tuning tool (step 1) should look roughly like this:
 
 ```text
-INFO Main: Surveillance recorder 0.5.0 starting (...)
-INFO StorageManager: Storage usage 0.03 GB / 45 GB, 40.1 GB free, 3 segments, oldest 2026-09-23 15:20 UTC
-INFO Recorder: Started recording to /home/ysak/surveillance/recordings (60 s segments, ...)
-WARNING StorageManager: Recovered unfinished segment 2026-09-23/15-24-00Z.mp4.partial -> 15-24-00Z.recovered.mp4: 31.9 s playable, removed 350 KiB of incomplete data
+Sensitivity 70 (pixel threshold 28), min area 0.5%, trigger 3 frames, cooldown 10 s, 5 frames/s. Running 60 s; Ctrl+C stops.
+
+22:10:01  largest  0.00%  [..............................]  quiet
+...
+22:10:25  largest  6.84%  [##############################]  moving
+  >>> MOTION STARTED (area 4.1%)
+22:10:26  largest 11.20%  [##############################]  MOTION
+...
+  <<< motion ended after 8.4 s (peak 14.9%)
+
+=== Summary ===
+Frames analysed      : 300, average 3.0 ms per frame (max 8.0 ms)
+Events               : 1
+Quiet-scene noise    : 99% of quiet frames had a largest region below 0.05%
+Advice               : min_area_percent 0.5 is comfortably above the noise
 ```
 
-For test B:
+The recorder (step 4) should look roughly like this:
 
 ```text
-INFO Recorder: Segment completed: 2026-09-23/15-31-00Z.mp4 ... size=9.4MB
-INFO StorageManager: Deleted 2026-09-23/15-27-00Z.mp4 (9.4 MB): over the 0.03 GB limit
+INFO Recorder: Started recording to ... (60 s segments, 2.50 Mbit/s, keyframe every 2 s)
+INFO MotionDetector: Motion detection on: sensitivity 70 (pixel threshold 28), min area 0.50%, cooldown 10 s, 5 analysed frames/s
+INFO Recorder: Segment completed: 2026-09-24/00-11-00Z.mp4 ... size=9.4MB motion=no
+INFO MotionDetector: Motion started (area 3.9% of the frame)
+INFO MotionDetector: Motion ended after 9.2 s (peak area 15.3%)
+INFO Recorder: Segment completed: 2026-09-24/00-12-00Z.mp4 ... size=9.6MB motion=yes
 ```
 
-The Phase 4 checker reports a gap before each `.recovered.mp4`, and the lost time is only the last half-written fragment, about 2 s at most. You can also copy a `.recovered.mp4` to your laptop and play it.
+For CPU, I expect roughly 12–15 % of one core, about the same as Phase 3. The detector itself should add only about 2 %.
+
+## Tuning guide
+
+| Problem | Change |
+|---|---|
+| Events with nobody there (noise, flicker) | Lower the sensitivity (e.g. 55), or raise `min_area_percent` above twice the "quiet-scene noise" figure |
+| A small or distant person is missed | Raise the sensitivity (e.g. 80) or lower `min_area_percent` (e.g. 0.2) |
+| One walk-through is split into several events | Raise `cooldown_seconds` (e.g. 20) |
+| A short blip starts an event | Raise `trigger_frames` (e.g. 5) |
+| Lots of events at night | Expected with this sensor: it has no infrared, so the image is mostly noise in the dark. Use a lower night sensitivity, or add an IR light (Phase 14 performance guide) |
+
+For example: `python3 tools/set_setting.py motion.sensitivity 55`. You can also try values temporarily with the tool first: `--sensitivity 55 --min-area 1.0`.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `Not saved: …` from `set_setting.py` | The message says what's wrong. For test D, the two settings must be changed in the order shown. |
-| No `Recovered …` line after test A | Wait 90 s. If there's still nothing, check that a `.partial` exists: `ls recordings/*/`. |
-| `ffprobe is not available` | `sudo apt install -y ffmpeg` |
-| `Maximum storage … does not fit on this disk` | Informational: your SD card can't hold 45 GB while keeping 2 GB free, so the free-space rule applies first. It goes away with a bigger disk or a smaller limit. |
+| `ABORTED, nothing changed` from the update script | One of your files differs from what I sent. Send me the message and I'll give you full files. |
+| `Motion detection disabled: OpenCV is not installed` | `sudo apt install -y python3-opencv` |
+| The tuning tool says the camera is in use | Stop the recorder first (Ctrl+C in its window). |
+| Frame gaps return in the Phase 4 checker | Send me the checker output. OpenCV is loaded before recording starts, so this shouldn't happen. |
 
-**Please send me the `Recovered …` line from test A, a few `Deleted …` lines and the report from test B, and the log lines from tests C and D.**
+**Please send me:**
+- the result of step 0 (the critical pause);
+- the tuning tool's summary from steps 1 and 3;
+- the recorder's log from step 4, showing the motion lines and `motion=yes/no`;
+- the CPU figure from step 5.
 
-After test E, the recorder can safely run for long periods, because the SD card can no longer fill up. It still only runs while your SSH session is open; it becomes an automatically started service in Phase 13. Phase 6 adds motion detection on the 640×480 low-resolution stream.
+Phase 7 then stores recordings and motion events in SQLite, the index the web interface will use.
