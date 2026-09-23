@@ -1,444 +1,33 @@
-Phase 4 (continuous recording in segments) is ready for you to run on the Pi. I tested the real code here against a fake camera that feeds genuine H.264 frames, but it hasn't touched your real camera yet.
+Your Phase 4 results showed one real problem, and I've fixed it. The first segment after every start had 1–2 short gaps of dropped frames. Everything else passed: every other segment had exactly 900 frames at 15.00 fps with 0.0 s missing between files. The crash recovery and camera-busy retries also worked exactly as intended.
 
-I'm treating the still image you saw in VLC as a VLC display quirk, so recordings use fragmented MP4 (the format that survives a power cut). If you run the fingerprint commands from my last message at some point, I'd still like to see the output.
+## What caused the gaps
 
-## What I tested here
+Picamera2 only loads its video-file library (PyAV) the first time it creates an MP4 file. In my recorder, that happens inside the encoder thread on the very first frame, which stalls it. The camera drops frames when the encoder stalls. In Phase 3 the library was loaded before recording started, which is why Phase 3 had no gaps. Loading it takes about 46 ms on this fast machine; on a Pi 4 reading from an SD card it's likely several hundred milliseconds, which is enough to drop 4–7 frames.
 
-- **Segments line up with the clock.** With 60-second test segments, files were named `13-45-00Z.mp4`, `13-46-00Z.mp4` and so on. Each was exactly 60.0 s and 900 frames, started on a keyframe, and had no timestamp gaps. Back-to-back segments joined with 0.0 s missing.
-- **A frozen camera is detected.** When I stopped the fake camera's frames, the recorder noticed after 11 s, saved the segment in progress, and restarted the camera pipeline.
-- **A busy camera is retried.** While the camera was "busy", reopening was retried after 5, 10 and 20 s, and recording resumed by itself once the camera was free.
-- **A hard crash loses almost nothing.** After `kill -9`, the unfinished segment stayed as a `.partial` file with 21.5 s still playable. On restart the recorder warned about it and kept it for recovery.
-- **Ctrl+C stops cleanly.** The current segment was saved as a normal `.mp4`.
-- **Bad settings are rejected with a clear message.** I tried a width that isn't a multiple of 16, a misspelled setting, a 45-second segment length, the text `"yes"` instead of `true`, a camera name containing `<script>`, and a size over the encoder's limit.
+I reproduced it here with a simulated camera that drops frames the way real hardware does:
 
-## How it works
+| Version | First segment | Other segments | Aligned segments start at |
+|---|---|---|---|
+| Old | FAIL: 1 gap at 0.0 s (+400 ms) | PASS | about 1–2 s after the boundary |
+| New | PASS, no gaps | PASS (900 frames each) | `14:34:00.048`, about 50 ms after |
 
-- **Its own segmenting output instead of Picamera2's `SplittableOutput`.** `SplittableOutput` waits for the next keyframe with no timeout, so a stalled camera would hang the recorder forever. My `SegmentingOutput` switches files inside the encoder's own thread at the first keyframe after each boundary, so it can never wait on a frame that won't come.
-- **The encoder thread never waits for the disk.** Flushing a closed segment to disk and renaming it `.partial` → `.mp4` happens in a separate thread.
-- **Every file starts at time zero,** so browsers show 0:00 to 5:00 for each segment.
-- **Naming:** the first segment after a start is named after its real start time and runs until the next 5-minute boundary, so it is shorter. After that, names are aligned: `…/2026-09-23/13-05-00Z.mp4`. The exact start time is kept in the segment's details.
-- **Supervisor:** if the camera can't be opened, or frames stop for 10 s, the pipeline is restarted, waiting 5, 10, 20… up to 60 s between attempts.
-- **Clock monitor:** each segment is marked with whether the clock was NTP-synchronised when it started (the Pi 4 has no battery-backed clock).
-- **Settings** are a validated JSON file, created with defaults on first run. **Logs** go to `logs/surveillance.log` (5 files × 5 MB maximum) and the console, in the format `2026-09-23 21:35:00 INFO Recorder: …`.
-- **Not yet built:** there is no storage limit until Phase 5 and no database until Phase 7. Until then, the filename convention (`.partial` means still being written, `.mp4` means complete) is how the rest of the system will tell them apart.
+## What changed in version 0.4.1
 
-> **Important:** recordings go to `~/surveillance/recordings` on the SD card with **no size limit** until Phase 5. At your measured 1.25 Mbit/s that's about 13.5 GB per day, so don't leave it running for days yet.
+1. **The library is loaded before the camera starts.** This is the fix for the gaps.
+2. **A keyframe is requested exactly at each boundary.** Before, every aligned segment waited for the next regular keyframe; yours consistently started about 1.9 s late (`14:06:01.957`, `14:07:01.942`…). Now a `…-05-00Z.mp4` file really starts at about :00.1. That will matter when motion events are matched to recordings.
+3. **libcamera's verbose INFO lines are hidden.** Only its warnings and errors appear now.
+4. **The checker shows where each gap is,** for example `1 timestamp gap(s) at 0.0 s (+400 ms)`.
+5. **Minor:** a doubled full stop is removed from the camera-busy error message, and stopping is safer if startup fails halfway.
 
-## Files
+## Update these five files
 
-| File | Purpose |
-|---|---|
-| `app/__init__.py` | Version number |
-| `app/fileutil.py` | Crash-safe `fsync` and atomic-write helpers |
-| `app/config.py` | Settings schema, validation, load and save |
-| `app/logging_setup.py` | Log format and rotation |
-| `app/clock.py` | NTP sync monitor |
-| `app/camera.py` | Opens and configures Picamera2 |
-| `app/recorder.py` | H.264 encoder, segment switching and finalising |
-| `app/main.py` | Entry point, supervisor and signal handling |
-| `tools/phase4_check_segments.py` | Checks the recorded segments |
-| `config/settings.json` | Created automatically on first run |
-
-## Install
-
-Everything needed is already installed (`python3-picamera2`, `python3-av`, `ffmpeg`). Create the folder:
-
-```bash
-mkdir -p ~/surveillance/app ~/surveillance/tools
-cd ~/surveillance
-```
-
-Then paste each block below into the terminal, one at a time. Each block writes one complete file.
+Paste each block into the terminal from `~/surveillance`. Each one replaces the whole file. `config.py`, `fileutil.py`, `clock.py` and `logging_setup.py` are unchanged.
 
 ```bash
 cat > ~/surveillance/app/__init__.py <<'EOF'
 """Raspberry Pi surveillance camera."""
 
-__version__ = "0.4.0"
-EOF
-```
-
-```bash
-cat > ~/surveillance/app/fileutil.py <<'EOF'
-"""Crash-safe file helpers."""
-from __future__ import annotations
-
-import os
-from pathlib import Path
-
-
-def fsync_directory(directory: Path) -> None:
-    """Persist a directory entry (a new or renamed file) across power loss."""
-    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def fsync_file(path: Path) -> None:
-    with open(path, "rb") as handle:
-        os.fsync(handle.fileno())
-
-
-def atomic_write_bytes(path: Path, data: bytes, mode: int = 0o640) -> None:
-    """Replace `path` so that readers see either the old or the new content, never a mix."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp")
-    try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-    fsync_directory(path.parent)
-EOF
-```
-
-```bash
-cat > ~/surveillance/app/config.py <<'EOF'
-"""Typed, validated settings stored as JSON.
-
-Every value is checked for type and range when loaded, so a typo or an out-of-range
-value stops the service with a clear message instead of misbehaving later.
-"""
-from __future__ import annotations
-
-import json
-import re
-from dataclasses import asdict, dataclass, field, fields
-from pathlib import Path
-from typing import Any
-
-from app.fileutil import atomic_write_bytes
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "settings.json"
-
-ALLOWED_SEGMENT_SECONDS = (60, 120, 300, 600, 900, 1800, 3600)
-LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
-LOG_FORMATS = ("text", "json")
-MAX_ENCODER_PIXELS = 1920 * 1080
-CAMERA_NAME_PATTERN = re.compile(r"^[\w][\w .,'()-]{0,39}$")
-
-
-class ConfigError(ValueError):
-    pass
-
-
-@dataclass(frozen=True)
-class CameraSettings:
-    camera_num: int = 0
-    name: str = "Camera 1"
-    width: int = 1296
-    height: int = 972
-    lores_width: int = 640
-    lores_height: int = 480
-    framerate: float = 15.0
-    bitrate: int = 2_500_000
-    keyframe_seconds: float = 2.0
-    rotate180: bool = False
-
-    def validate(self) -> None:
-        _check_range("camera.camera_num", self.camera_num, 0, 3)
-        if not CAMERA_NAME_PATTERN.match(self.name):
-            raise ConfigError("camera.name must be 1-40 letters, digits, spaces or . , ' ( ) - _")
-        _check_range("camera.width", self.width, 64, 1920)
-        _check_range("camera.height", self.height, 64, 1920)
-        if self.width % 16 or self.height % 2:
-            raise ConfigError("camera.width must be a multiple of 16 and camera.height must be even")
-        if self.width * self.height > MAX_ENCODER_PIXELS:
-            raise ConfigError("camera.width x camera.height exceeds the 1920x1080 hardware encoder limit")
-        _check_range("camera.lores_width", self.lores_width, 160, self.width)
-        _check_range("camera.lores_height", self.lores_height, 120, self.height)
-        if self.lores_width % 16 or self.lores_height % 2:
-            raise ConfigError("camera.lores_width must be a multiple of 16 and lores_height even")
-        _check_range("camera.framerate", self.framerate, 1.0, 30.0)
-        _check_range("camera.bitrate", self.bitrate, 250_000, 10_000_000)
-        _check_range("camera.keyframe_seconds", self.keyframe_seconds, 0.5, 10.0)
-
-    @property
-    def keyframe_interval_frames(self) -> int:
-        return max(1, round(self.keyframe_seconds * self.framerate))
-
-
-@dataclass(frozen=True)
-class RecordingSettings:
-    segment_seconds: int = 300
-
-    def validate(self) -> None:
-        if self.segment_seconds not in ALLOWED_SEGMENT_SECONDS:
-            allowed = ", ".join(str(value) for value in ALLOWED_SEGMENT_SECONDS)
-            raise ConfigError(f"recording.segment_seconds must be one of: {allowed}")
-
-
-@dataclass(frozen=True)
-class PathSettings:
-    recordings_dir: str = "recordings"
-    log_dir: str = "logs"
-
-    def validate(self) -> None:
-        for name in ("recordings_dir", "log_dir"):
-            value = getattr(self, name)
-            if not value.strip() or "\x00" in value:
-                raise ConfigError(f"paths.{name} must be a non-empty path")
-
-
-@dataclass(frozen=True)
-class LoggingSettings:
-    level: str = "INFO"
-    format: str = "text"
-    console: bool = True
-    max_bytes: int = 5_000_000
-    backup_count: int = 5
-
-    def validate(self) -> None:
-        if self.level not in LOG_LEVELS:
-            raise ConfigError(f"logging.level must be one of: {', '.join(LOG_LEVELS)}")
-        if self.format not in LOG_FORMATS:
-            raise ConfigError(f"logging.format must be one of: {', '.join(LOG_FORMATS)}")
-        _check_range("logging.max_bytes", self.max_bytes, 100_000, 50_000_000)
-        _check_range("logging.backup_count", self.backup_count, 1, 20)
-
-
-@dataclass(frozen=True)
-class Settings:
-    camera: CameraSettings = field(default_factory=CameraSettings)
-    recording: RecordingSettings = field(default_factory=RecordingSettings)
-    paths: PathSettings = field(default_factory=PathSettings)
-    logging: LoggingSettings = field(default_factory=LoggingSettings)
-
-    def validate(self) -> None:
-        for section in fields(self):
-            getattr(self, section.name).validate()
-
-    @property
-    def recordings_dir(self) -> Path:
-        return resolve_path(self.paths.recordings_dir)
-
-    @property
-    def log_dir(self) -> Path:
-        return resolve_path(self.paths.log_dir)
-
-
-def resolve_path(value: str) -> Path:
-    """Relative paths are relative to the project directory, so the app works from any cwd."""
-    path = Path(value).expanduser()
-    return path if path.is_absolute() else PROJECT_ROOT / path
-
-
-def _check_range(name: str, value: float, low: float, high: float) -> None:
-    if not low <= value <= high:
-        raise ConfigError(f"{name} must be between {low:g} and {high:g} (got {value!r})")
-
-
-def _coerce(value: Any, expected: type, name: str) -> Any:
-    if expected is bool:
-        if isinstance(value, bool):
-            return value
-    elif expected is int:
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value
-    elif expected is float:
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return float(value)
-    elif expected is str:
-        if isinstance(value, str):
-            return value
-    raise ConfigError(f"{name} must be of type {expected.__name__} (got {value!r})")
-
-
-def _build_section(cls: type, data: Any, section: str) -> Any:
-    if not isinstance(data, dict):
-        raise ConfigError(f"'{section}' must be a JSON object")
-    known = {f.name for f in fields(cls)}
-    unknown = sorted(set(data) - known)
-    if unknown:
-        raise ConfigError(f"unknown setting(s) in '{section}': {', '.join(unknown)}")
-    defaults = cls()
-    values = {}
-    for f in fields(cls):
-        default = getattr(defaults, f.name)
-        values[f.name] = (_coerce(data[f.name], type(default), f"{section}.{f.name}")
-                          if f.name in data else default)
-    return cls(**values)
-
-
-def settings_from_dict(data: Any) -> Settings:
-    if not isinstance(data, dict):
-        raise ConfigError("settings file must contain a JSON object")
-    section_types = {f.name: type(getattr(Settings(), f.name)) for f in fields(Settings)}
-    unknown = sorted(set(data) - set(section_types))
-    if unknown:
-        raise ConfigError(f"unknown section(s): {', '.join(unknown)}")
-    settings = Settings(**{name: _build_section(cls, data.get(name, {}), name)
-                           for name, cls in section_types.items()})
-    settings.validate()
-    return settings
-
-
-def load_settings(path: Path = DEFAULT_CONFIG_PATH, create_if_missing: bool = True) -> tuple[Settings, bool]:
-    """Return (settings, created). A missing file is created with defaults if allowed."""
-    if not path.exists():
-        if not create_if_missing:
-            raise ConfigError(f"{path} does not exist")
-        settings = Settings()
-        save_settings(settings, path)
-        return settings, True
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ConfigError(f"{path}: invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}") from None
-    except OSError as exc:
-        raise ConfigError(f"cannot read {path}: {exc.strerror}") from None
-    return settings_from_dict(data), False
-
-
-def save_settings(settings: Settings, path: Path = DEFAULT_CONFIG_PATH) -> None:
-    settings.validate()
-    text = json.dumps(asdict(settings), indent=2) + "\n"
-    atomic_write_bytes(path, text.encode("utf-8"))
-EOF
-```
-
-```bash
-cat > ~/surveillance/app/logging_setup.py <<'EOF'
-"""Structured logging: timestamp, level, component, message; size-capped rotation."""
-from __future__ import annotations
-
-import json
-import logging
-import sys
-from datetime import datetime, timezone
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
-
-from app.config import LoggingSettings
-
-TEXT_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
-TEXT_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
-LOG_FILE_NAME = "surveillance.log"
-
-
-class JsonFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        entry = {
-            "ts": datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="milliseconds"),
-            "level": record.levelname,
-            "component": record.name,
-            "message": record.getMessage(),
-        }
-        if record.exc_info:
-            entry["exception"] = self.formatException(record.exc_info)
-        return json.dumps(entry, ensure_ascii=False)
-
-
-def setup_logging(settings: LoggingSettings, log_dir: Path) -> Path | None:
-    """Configure the root logger. Returns the log file path, or None if it is not writable."""
-    formatter: logging.Formatter = (JsonFormatter() if settings.format == "json"
-                                    else logging.Formatter(TEXT_FORMAT, TEXT_DATE_FORMAT))
-    root = logging.getLogger()
-    root.setLevel(settings.level)
-    for handler in list(root.handlers):
-        root.removeHandler(handler)
-        handler.close()
-
-    if settings.console:
-        console = logging.StreamHandler(sys.stderr)
-        console.setFormatter(formatter)
-        root.addHandler(console)
-
-    log_file: Path | None = log_dir / LOG_FILE_NAME
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        file_handler = RotatingFileHandler(log_file, maxBytes=settings.max_bytes,
-                                           backupCount=settings.backup_count, encoding="utf-8")
-    except OSError as exc:
-        log_file = None
-        if not settings.console:
-            fallback = logging.StreamHandler(sys.stderr)
-            fallback.setFormatter(formatter)
-            root.addHandler(fallback)
-        logging.getLogger("Logging").error("Cannot write log file in %s: %s", log_dir, exc.strerror)
-    else:
-        file_handler.setFormatter(formatter)
-        root.addHandler(file_handler)
-
-    logging.captureWarnings(True)
-    # Picamera2 logs every configuration change at INFO; keep only its warnings and errors.
-    logging.getLogger("picamera2").setLevel(max(logging.WARNING, root.level))
-    return log_file
-EOF
-```
-
-```bash
-cat > ~/surveillance/app/clock.py <<'EOF'
-"""Tracks whether the system clock is NTP-synchronised.
-
-The Pi 4 has no battery-backed clock: after a power cut without internet it resumes from the
-last saved time, so recordings made before synchronisation are flagged.
-"""
-from __future__ import annotations
-
-import logging
-import subprocess
-import threading
-from pathlib import Path
-
-log = logging.getLogger("Clock")
-
-TIMESYNCD_FLAG = Path("/run/systemd/timesync/synchronized")
-
-
-def query_synchronized() -> bool | None:
-    try:
-        result = subprocess.run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
-                                capture_output=True, text=True, timeout=5, check=False)
-        value = result.stdout.strip()
-        if value in ("yes", "no"):
-            return value == "yes"
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    return True if TIMESYNCD_FLAG.exists() else None
-
-
-class ClockMonitor:
-    def __init__(self, interval_seconds: float = 60.0) -> None:
-        self._interval = interval_seconds
-        self._synced: bool | None = None
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="clock-monitor", daemon=True)
-
-    @property
-    def synchronized(self) -> bool | None:
-        return self._synced
-
-    def start(self) -> None:
-        self._update()
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread.is_alive():
-            self._thread.join(timeout=5)
-
-    def _run(self) -> None:
-        while not self._stop.wait(self._interval):
-            self._update()
-
-    def _update(self) -> None:
-        synced = query_synchronized()
-        if synced != self._synced:
-            if synced:
-                log.info("System clock is NTP-synchronised")
-            else:
-                log.warning("System clock is NOT synchronised (%s); new recordings are flagged "
-                            "until it is", "unknown" if synced is None else "no NTP sync yet")
-        self._synced = synced
+__version__ = "0.4.1"
 EOF
 ```
 
@@ -477,7 +66,8 @@ class Camera:
         try:
             self.picam2 = Picamera2(s.camera_num)
         except (RuntimeError, IndexError) as exc:
-            raise CameraError(f"cannot open camera {s.camera_num} (in use by another program?): {exc}") from exc
+            reason = str(exc).rstrip(".")
+            raise CameraError(f"cannot open camera {s.camera_num} (in use by another program?): {reason}") from exc
 
         try:
             size = (s.width, s.height)
@@ -538,6 +128,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+# PyavOutput imports av lazily on first use, which would happen inside the encoder thread when the
+# first segment opens; on a Pi 4 that import takes long enough to drop frames.
+import av  # noqa: F401
 from picamera2.encoders import H264Encoder
 from picamera2.outputs import Output, PyavOutput
 
@@ -732,6 +325,8 @@ class Recorder:
         self._started_monotonic = 0.0
         self._finalize_queue: queue.Queue[_OpenSegment | None] = queue.Queue()
         self._finalizer = threading.Thread(target=self._finalize_loop, name="segment-finalizer", daemon=True)
+        self._boundary_stop = threading.Event()
+        self._boundary_thread: threading.Thread | None = None
         self._listeners: list[Callable[[Segment], None]] = []
         self.last_segment: Segment | None = None
 
@@ -759,12 +354,18 @@ class Recorder:
         self._camera.picam2.start_recording(encoder, self._output)
         self._recording = True
         self._started_monotonic = time.monotonic()
+        self._boundary_thread = threading.Thread(target=self._boundary_loop, args=(encoder,),
+                                                 name="segment-boundaries", daemon=True)
+        self._boundary_thread.start()
         log.info("Started recording to %s (%d s segments, %.2f Mbit/s, keyframe every %g s)",
                  self.recordings_dir, self.settings.recording.segment_seconds, cam.bitrate / 1e6,
                  cam.keyframe_seconds)
 
     def stop(self) -> None:
         was_recording = self._recording
+        self._boundary_stop.set()
+        if self._boundary_thread is not None and self._boundary_thread.is_alive():
+            self._boundary_thread.join(timeout=5)
         if self._camera is not None and self._camera.picam2 is not None:
             if self._recording:
                 try:
@@ -798,6 +399,19 @@ class Recorder:
     @property
     def write_error(self) -> str | None:
         return self._output.write_error if self._output else None
+
+    def _boundary_loop(self, encoder: H264Encoder) -> None:
+        """Request a keyframe at each boundary so segments start on time, not up to 2 s late."""
+        segment_seconds = self.settings.recording.segment_seconds
+        while True:
+            now = time.time()
+            next_boundary = (math.floor(now / segment_seconds) + 1) * segment_seconds
+            if self._boundary_stop.wait(next_boundary - now):
+                return
+            try:
+                encoder.force_key_frame()
+            except Exception as exc:  # noqa: BLE001 - regular keyframes still split the segment
+                log.debug("Could not force a keyframe: %s", exc)
 
     def _finalize_loop(self) -> None:
         while True:
@@ -851,21 +465,25 @@ SIGTERM/SIGINT (Ctrl+C) stop cleanly and finalise the current segment.
 """
 from __future__ import annotations
 
-import argparse
-import logging
 import os
-import signal
-import sys
-import threading
-import time
-from pathlib import Path
 
-from app import __version__
-from app.camera import CameraError
-from app.clock import ClockMonitor
-from app.config import DEFAULT_CONFIG_PATH, ConfigError, Settings, load_settings
-from app.logging_setup import setup_logging
-from app.recorder import Recorder
+# libcamera reads this when it is first loaded, so it must be set before app.recorder is imported.
+os.environ.setdefault("LIBCAMERA_LOG_LEVELS", "*:WARN")
+
+import argparse  # noqa: E402
+import logging  # noqa: E402
+import signal  # noqa: E402
+import sys  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from app import __version__  # noqa: E402
+from app.camera import CameraError  # noqa: E402
+from app.clock import ClockMonitor  # noqa: E402
+from app.config import DEFAULT_CONFIG_PATH, ConfigError, Settings, load_settings  # noqa: E402
+from app.logging_setup import setup_logging  # noqa: E402
+from app.recorder import Recorder  # noqa: E402
 
 log = logging.getLogger("Main")
 
@@ -1062,14 +680,15 @@ def main() -> int:
             failures += 1
             continue
         times = [t for t, _ in packets]
-        gaps = sum(1 for a, b in zip(times, times[1:]) if b - a > 1.5 / fps)
+        gaps = [(a - times[0], b - a) for a, b in zip(times, times[1:]) if b - a > 1.5 / fps]
         duration = times[-1] - times[0] + 1 / fps
         measured_fps = (len(times) - 1) / (times[-1] - times[0])
         problems = []
         if not packets[0][1]:
             problems.append("does not start with a keyframe")
         if gaps:
-            problems.append(f"{gaps} timestamp gap(s)")
+            where = ", ".join(f"{at:.1f} s (+{step * 1000:.0f} ms)" for at, step in gaps[:3])
+            problems.append(f"{len(gaps)} timestamp gap(s) at {where}")
         if (width, height) != size:
             problems.append(f"resolution {width}x{height}")
         if abs(measured_fps - fps) > 0.05 * fps:
@@ -1119,111 +738,51 @@ if __name__ == "__main__":
 EOF
 ```
 
-## Test procedure
+## Retest
 
-Run everything **as `ysak`**, from `~/surveillance`. You'll need **two SSH windows** for the crash and camera-busy tests.
-
-**0. First run creates the settings file.** Stop it with Ctrl+C once you see `Started recording`:
+**1. Clear the old test recordings** so the checker only sees segments from the new version. Your config should still have 60-second segments:
 
 ```bash
 cd ~/surveillance
-python3 -m app.main
+rm -rf recordings/*
+grep segment_seconds config/settings.json      # should show 60
 ```
 
-Then switch to **60-second segments for testing**:
-
-```bash
-sed -i 's/"segment_seconds": 300/"segment_seconds": 60/' config/settings.json
-grep segment_seconds config/settings.json
-```
-
-**A. Normal recording, about 5 minutes.**
+**2. Record for about 4 minutes, then stop with Ctrl+C:**
 
 ```bash
 python3 -m app.main
 ```
 
-Wait for at least four `Segment completed` lines, then press Ctrl+C and check the files:
+**3. Start it again, record for about 1 minute, and stop.** This adds a second "first segment after a start", which is exactly the case that failed before.
+
+**4. Run the checker:**
 
 ```bash
 python3 tools/phase4_check_segments.py
 ```
 
-**B. Crash test.** In window 1, start `python3 -m app.main`. After about 90 seconds, run this in window 2:
-
-```bash
-pkill -9 -f "^python3 -m app.main"
-```
-
-Back in window 1, start the recorder again. It should warn `1 unfinished segment(s) from a previous run`. Let it run for about 2 minutes, press Ctrl+C, then run the checker again.
-
-**C. Camera-busy recovery.** In window 2, occupy the camera:
-
-```bash
-rpicam-hello -n -t 0
-```
-
-In window 1, run `python3 -m app.main`. It should report `Could not start recording: cannot open camera 0 … Retrying in 5 s`, then 10 s, then 20 s. Press Ctrl+C in window 2 to free the camera; recording should start within one retry. Then press Ctrl+C in window 1.
-
-**D. Settings validation.** Put in a bad value, try to start, then restore it:
-
-```bash
-sed -i 's/"framerate": 15.0/"framerate": 99/' config/settings.json
-python3 -m app.main          # should refuse to start
-sed -i 's/"framerate": 99/"framerate": 15.0/' config/settings.json
-```
-
-**E. Go back to 5-minute segments and check the log:**
+**5. If it passes, go back to 5-minute segments** (this was test E):
 
 ```bash
 sed -i 's/"segment_seconds": 60/"segment_seconds": 300/' config/settings.json
-tail -n 20 logs/surveillance.log
 ```
-
-**F. Optional playback check.** Copy one segment to your laptop (run this on the laptop) and play it:
-
-```bash
-scp 'ysak@ysak.local:~/surveillance/recordings/*/*.mp4' .
-```
-
-**Optional cleanup when you're done:** `rm -rf ~/surveillance/recordings/*`
 
 ## Expected output
 
-For test A, the log shows (in your local time, UTC+8):
+The console should no longer show libcamera's `[0:43:48…] INFO` lines. Aligned segments should start within about 0.1 s of the minute:
 
 ```text
-2026-09-23 21:50:10 INFO Main: Surveillance recorder 0.4.0 starting (config /home/ysak/surveillance/config/settings.json, log /home/ysak/surveillance/logs/surveillance.log)
-2026-09-23 21:50:10 INFO Clock: System clock is NTP-synchronised
-2026-09-23 21:50:12 INFO Camera: Opened ov5647: main 1296x972, lores 640x480, 15 fps, sensor mode 1296x972
-2026-09-23 21:50:12 INFO Recorder: Started recording to /home/ysak/surveillance/recordings (60 s segments, 2.50 Mbit/s, keyframe every 2 s)
-2026-09-23 21:51:01 INFO Recorder: Segment completed: 2026-09-23/13-50-12Z.mp4 start=2026-09-23T13:50:12.874+00:00 duration=48.0s frames=720 size=7.5MB
-2026-09-23 21:52:01 INFO Recorder: Segment completed: 2026-09-23/13-51-00Z.mp4 start=2026-09-23T13:51:01.027+00:00 duration=60.0s frames=900 size=9.4MB
+2026-09-23 22:40:05 INFO Main: Surveillance recorder 0.4.1 starting (...)
+2026-09-23 22:40:05 INFO Clock: System clock is NTP-synchronised
+2026-09-23 22:40:06 INFO Camera: Opened ov5647: main 1296x972, lores 640x480, 15 fps, sensor mode 1296x972
+2026-09-23 22:40:06 INFO Recorder: Started recording to /home/ysak/surveillance/recordings (60 s segments, ...)
+2026-09-23 22:41:00 INFO Recorder: Segment completed: 2026-09-23/14-40-06Z.mp4 start=...T14:40:06.4... duration=53.6s frames=804 ...
+2026-09-23 22:42:00 INFO Recorder: Segment completed: 2026-09-23/14-41-00Z.mp4 start=...T14:41:00.0... duration=60.0s frames=900 ...
 ```
 
-The first segment is shorter because it only runs until the next minute boundary. Aligned segments start 0–2 s after the boundary, because switching waits for a keyframe.
+The checker should end with `FAIL=0 WARN=0 stopped-and-restarted=1` and `RESULT: SEGMENTS OK`, with every line `[PASS]` including the first segment of each run.
 
-The checker should show:
+**If a first segment still shows a gap,** the checker now says where it is. A gap at `0.0 s` would mean the camera itself delivers its first frames unevenly at start-up, rather than my code stalling. The fix would then be to skip the first second of frames. Please send me the checker output either way.
 
-```text
-[PASS] 13-51-00Z.mp4:   60.0 s, 900 frames, 15.00 fps, 9.4 MB, 1.25 Mbit/s
-...
-Continuity (a new segment should start where the previous one ended):
-  [PASS] 13-50-12Z.mp4 -> 13-51-00Z.mp4: +0.0 s
-...
-RESULT: SEGMENTS OK
-```
-
-After test B, the stop is shown as `[INFO] … recorder stopped/restarted`, and the leftover `.partial` is listed with its playable seconds. Phase 5 will recover these files automatically.
-
-## Troubleshooting
-
-| Symptom | Fix |
-|---|---|
-| `ModuleNotFoundError: No module named 'app'` | Run it from `~/surveillance`, exactly as `python3 -m app.main`. |
-| `Configuration error: …` | The message names the setting at fault. Fix it in `config/settings.json`, or delete the file to recreate the defaults. |
-| `Recording unhealthy: no frames …` keeps repeating | Send me the log and the output of `vcgencmd get_throttled`. |
-| A checker `[WARN] … unaccounted for` between aligned segments | Send me the checker output. Frames were lost at a switch between files, which shouldn't happen. |
-| `Permission denied` on `recordings` or `logs` | Earlier root use probably left root-owned files. Run `sudo chown -R ysak:ysak ~/surveillance`. |
-
-**Please send me the checker output from tests A and B, and the log lines from test C.** Phase 5 then adds the storage limit (45 GB), the emergency free-space threshold, deleting the oldest finished segment first (never the one being written), and automatic recovery of `.partial` files at startup.
+Once this passes, Phase 5 adds the storage limit (45 GB), the emergency free-space threshold, deleting the oldest finished segment first (never the one being written), and automatic recovery of `.partial` files after a crash.
