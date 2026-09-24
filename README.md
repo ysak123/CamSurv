@@ -1,900 +1,549 @@
-Phase 11 (login and security) is ready for you to test on the Pi. It passed all my tests here in Chrome and with scripted attacks.
+Phase 11b, the editable Settings page, is ready for you to test on the Pi. It passed every check I ran here, including tampered form submissions and a hand-broken settings file. **Restart both the recorder and the web interface after updating**, because the recorder needs its new "watch the settings file" code.
 
-## What Phase 11 adds
+## What Phase 11b adds
 
-**Accounts are created only on the Pi, over SSH.** There's deliberately no sign-up page in the browser, which a stranger could otherwise reach first. `tools/manage_users.py` has `create`, `passwd`, `list`, `unlock`, `logout` and `log`.
+**Settings page**
+- **Camera:** name, resolution (1296×972 full view, 1920×1080, 1280×720 or 640×480), frame rate, bitrate in Mbit/s, keyframe interval, rotate 180°, and **colour tuning**.
+- **Recording:** segment length.
+- **Motion detection:** on/off, sensitivity, minimum area, cooldown, trigger frames, analysis rate, how long to keep events.
+- **Storage:** maximum GB, emergency free space, maximum age, retention.
+- **Live view:** on/off, frame rate, quality, maximum viewers, auto-pause time.
+- **Security:** idle logout, maximum session length, lockout threshold.
+- **Interface:** dashboard refresh rate and log level.
+- **Not editable in the browser:** the recordings and database folders, the web address and the required mount are shown read-only. A mistake there could lock you out or send recordings to the wrong disk, so they stay on the command line.
 
-**Passwords**
-- **At least 15 characters,** and not the username or a very common password. There are no "must include a symbol" rules: a long passphrase is stronger.
-- **Hashed with Argon2id** using the RFC 9106 settings (64 MiB, 3 passes, 4 lanes). Each check deliberately takes a few hundred milliseconds on the Pi, so guessing is slow and expensive.
-- **At most two checks run at once,** so a flood of login attempts can't use up the Pi's memory.
+**Safety**
+- Every submitted value is re-checked on the server by type and range, and drop-down values must be one of the allowed options; nothing sent by the browser is trusted. The complete result then goes through the same validation as the settings file, including cross-field rules such as "motion analysis rate can't exceed the camera frame rate".
+- **Saving requires your password** unless you entered it in the last 5 minutes. Wrong passwords here count towards the same lockout as the login page, so a stolen session can't be used to guess your password.
+- Every save is recorded in the security log with each old → new value.
 
-**Protection against guessing**
-- **Username lockout:** after 5 wrong passwords, that username is locked for 30 s, then 60 s, 2 min and so on, up to 15 min. **This applies to invented usernames too.**
-- **Global limit:** more than 30 failures in 10 minutes pauses all logins for a while.
-- The counters are stored in the database, so restarting doesn't reset them.
-- If you ever lock yourself out, run `manage_users.py unlock`.
+**Changes apply automatically**
+- **The recorder** notices a changed settings file within about 5 s and restarts its camera pipeline, so a few seconds of video are skipped. This also applies to `tools/set_setting.py`, so you no longer need to restart the recorder by hand.
+- **Web-only changes** (security, dashboard refresh) don't interrupt recording at all.
+- **A settings file broken by hand is ignored.** The recorder keeps running with the last good settings and logs why, and the Settings page shows a warning banner instead of saving.
+- **The web interface restarts itself** after a save, and the page reloads with the new values. You stay logged in.
 
-**Sessions**
-- A 256-bit random token in a cookie that JavaScript can't read. It's only sent over secure connections, never to other websites, and only to this exact address.
-- The database stores only a hash of the token, so a copy of the database contains no usable logins.
-- You're logged out after 30 minutes idle, or 12 hours at most.
-- Changing your password logs out every other session, and the Account page has a "Log out all other sessions" button.
+**Colour tuning for your NoIR camera.** The drop-down lists the tuning files for your sensor that libcamera ships (for example `ov5647.json` and `ov5647_noir.json`). Choosing `ov5647_noir.json` usually gives more natural daylight colours on cameras without an infrared filter.
 
-**Every page, stream and file is protected.** Pages redirect to the login page. The API, live stream, snapshot, video and downloads answer `401`. Only the login page and the style/script files are public.
+## What I tested here (Chrome, fake camera, mock tuning folder)
 
-**Cross-site attacks (CSRF) are blocked.** Every form must come from the camera's own pages, and must carry a secret token unique to your session.
-
-**Security log.** Logins, failures, lockouts, password changes and logouts are shown on the Account page and by `manage_users.py log`.
-
-**Files:**
-- `auth.db` is created readable only by your user (`-rw-------`).
-- New settings in the `auth` section: `idle_timeout_minutes` (default 30), `session_max_hours` (12) and `lockout_threshold` (5).
-
-## Two problems my tests caught and I fixed
-
-1. **Every login would have failed.** The pages told browsers `Referrer-Policy: no-referrer`, and under that policy browsers label every form post as coming from origin `null`. My same-origin check would then have rejected all logins. It's now `same-origin`: the browser still never sends the camera's address to other websites.
-2. **The lockout revealed which usernames exist.** Only real accounts got locked, so after 5 guesses an attacker would see "Too many attempts" for real usernames and "Wrong username or password" for invented ones. Every attempted username now gets the same treatment.
-
-## What I tested here
-
-**In Chrome:**
-- The cookie was accepted with all its protections, even over plain `http://127.0.0.1` through the tunnel.
-- JavaScript can't read the cookie.
-- A same-site POST without the CSRF token got `403`.
-- Changing the password needs the current one.
-- A session idle for 60 minutes bounced to the login page.
-- Logout ends the session on the server; the API then answers `401`.
-- Live view, video playback and the dashboard snapshot all still work after logging in.
-
-**With scripted attacks:**
-- Every protected route answers `302` (pages) or `401` (everything else) without a login.
-- A login from a foreign site got `403`.
-- **A real and an invented username behave identically:** "Wrong username or password" at about 53 ms four times, then "Too many failed attempts" at about 10 ms.
-- The correct password is also refused while the username is locked.
-
-**Update script:** turns your 0.10.0 files into files identical to the tested ones, and aborts safely if run twice.
-
-**Browser note:** Chrome, Edge and Firefox accept this kind of secure cookie on `http://localhost`. **Safari may not,** so please use one of the others through the tunnel for now. Once Tailscale gives the camera a real `https://` address in Phase 12, every browser works.
-
-## Install
-
-```bash
-sudo apt install -y python3-argon2
-python3 -c "import argon2; print('argon2 ok')"
-```
+- **Tuning choices:** only `ov5647.json` and `ov5647_noir.json` were offered. The mock folder also contained `imx219.json`, which was correctly left out because it belongs to a different sensor.
+- **Invalid combination:** framerate 10 with analysis rate 15 was refused with "motion.analysis_fps cannot be higher than camera.framerate".
+- **Tampered submissions**, sent by a script running inside the page, were all refused with `400`:
+  - a 45-second segment length;
+  - `../../etc/passwd` as the tuning file;
+  - an unlisted resolution;
+  - a `<script>` camera name.
+- **No CSRF token:** refused with `403`, and the file was left untouched.
+- **Password confirmation:**
+  - It's required once the last confirmation is more than 5 minutes old. A wrong password was refused and logged as `reauth_failed`.
+  - With the right password the change was saved. Recorder log: `Settings changed (camera.bitrate, camera.tuning_file, motion.sensitivity); restarting the recording pipeline`, then `Opened ov5647 … tuning ov5647_noir.json`.
+  - The page reloaded by itself with the new values.
+- **Web-only change:** saving the idle-timeout change gave `Settings changed (auth.idle_timeout_minutes); recording is not affected`.
+- **Broken file:** I set a framerate of 500 by hand. The recorder logged it as invalid and kept its settings, and the page showed the warning and refused to save.
+- **Update script:** turns your 0.11.0 files into files identical to the tested ones, and aborts safely if run twice.
 
 ## Update the files
 
-**1. Update script.** It changes `__init__.py`, `config.py`, `web.py`, `base.html`, `app.js` and `style.css`, making `.bak` backups:
+Stop both programs first (Ctrl+C in both windows).
+
+**1. Update script.** It changes 10 files and makes `.bak` backups:
 
 ```bash
 cd ~/surveillance
-cat > update_to_0_11_0.py <<'EOF'
+cat > update_to_0_11_1.py <<'EOF'
 #!/usr/bin/env python3
-"""Update the surveillance project from 0.10.0 to 0.11.0 (run from ~/surveillance)."""
+"""Update the surveillance project from 0.11.0 to 0.11.1 (run from ~/surveillance)."""
 import shutil, sys
 from pathlib import Path
 
 EDITS = [
     ('app/__init__.py',
-     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.10.0"\n',
-     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.11.0"\n'),
+     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.11.0"\n',
+     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.11.1"\n'),
+    ('app/auth.py',
+     '        with closing(self._connect()) as conn:\n            if not ok:\n                conn.execute("INSERT INTO login_failures (at) VALUES (?)", (now,))\n                conn.execute("DELETE FROM login_failures WHERE at <= ?", (now - GLOBAL_WINDOW_S,))\n                failed = (lock["failed"] if lock else 0) + 1\n                locked_until = 0\n                if failed >= self._lock_threshold:\n                    locked_until = now + min(LOCK_MAX_S, LOCK_BASE_S * 2 ** (failed - self._lock_threshold))\n                conn.execute("INSERT INTO lockouts (username, failed, locked_until, updated_at) VALUES (?, ?, ?, ?)"\n                             " ON CONFLICT(username) DO UPDATE SET failed = excluded.failed,"\n                             " locked_until = excluded.locked_until, updated_at = excluded.updated_at",\n                             (name, failed, locked_until, now))\n                conn.execute("DELETE FROM lockouts WHERE updated_at < ? AND locked_until < ?",\n                             (now - LOCKOUT_FORGET_S, now))\n                self.audit(conn, safe_label(name), "login_failed")\n                log.warning("Failed login for %r", safe_label(name))\n',
+     '        with closing(self._connect()) as conn:\n            if not ok:\n                self._register_failure(conn, name, lock, now)\n                self.audit(conn, safe_label(name), "login_failed")\n                log.warning("Failed login for %r", safe_label(name))\n'),
+    ('app/auth.py',
+     '            log.info("User %s logged in", name)\n            return token, None\n\n    def _new_session(self, conn: sqlite3.Connection, user_id: int, user_agent: str) -> str:\n',
+     '            log.info("User %s logged in", name)\n            return token, None\n\n    def _register_failure(self, conn: sqlite3.Connection, name: str, lock: sqlite3.Row | None, now: int) -> None:\n        conn.execute("INSERT INTO login_failures (at) VALUES (?)", (now,))\n        conn.execute("DELETE FROM login_failures WHERE at <= ?", (now - GLOBAL_WINDOW_S,))\n        failed = (lock["failed"] if lock else 0) + 1\n        locked_until = 0\n        if failed >= self._lock_threshold:\n            locked_until = now + min(LOCK_MAX_S, LOCK_BASE_S * 2 ** (failed - self._lock_threshold))\n        conn.execute("INSERT INTO lockouts (username, failed, locked_until, updated_at) VALUES (?, ?, ?, ?)"\n                     " ON CONFLICT(username) DO UPDATE SET failed = excluded.failed,"\n                     " locked_until = excluded.locked_until, updated_at = excluded.updated_at",\n                     (name, failed, locked_until, now))\n        conn.execute("DELETE FROM lockouts WHERE updated_at < ? AND locked_until < ?",\n                     (now - LOCKOUT_FORGET_S, now))\n\n    def _new_session(self, conn: sqlite3.Connection, user_id: int, user_agent: str) -> str:\n'),
+    ('app/auth.py',
+     '                                " WHERE user_id = ? ORDER BY last_seen DESC", (user_id,)).fetchall()\n\n    def change_password(self, session: dict, current: str, new: str) -> None:\n        with closing(self._connect()) as conn:\n',
+     '                                " WHERE user_id = ? ORDER BY last_seen DESC", (user_id,)).fetchall()\n\n    def reauth_fresh(self, session: dict, max_age_s: int) -> bool:\n        return int(time.time()) - session["reauth_at"] <= max_age_s\n\n    def reauth(self, session: dict, password: str) -> None:\n        """Confirm the password for a sensitive action. Failures count towards the lockout,\n        so a stolen session cannot be used to guess the password."""\n        name, now = session["username"], int(time.time())\n        with closing(self._connect()) as conn:\n            lock = conn.execute("SELECT * FROM lockouts WHERE username = ?", (name,)).fetchone()\n            if lock and lock["locked_until"] > now:\n                raise AuthError("Too many wrong passwords. Try again in a few minutes.")\n            user = conn.execute("SELECT password_hash FROM users WHERE id = ?", (session["user_id"],)).fetchone()\n        ok = self._verify(user["password_hash"], password[:MAX_PASSWORD_LENGTH])\n        with closing(self._connect()) as conn:\n            if not ok:\n                self._register_failure(conn, name, lock, now)\n                self.audit(conn, name, "reauth_failed")\n                raise AuthError("That password is wrong.")\n            conn.execute("DELETE FROM lockouts WHERE username = ?", (name,))\n            conn.execute("UPDATE sessions SET reauth_at = ? WHERE token_hash = ?", (now, session["token_hash"]))\n        session["reauth_at"] = now\n\n    def change_password(self, session: dict, current: str, new: str) -> None:\n        with closing(self._connect()) as conn:\n'),
+    ('app/camera.py',
+     '        self.settings = settings\n        self.picam2 = None\n\n    def open(self) -> None:\n',
+     '        self.settings = settings\n        self.picam2 = None\n        self.model: str | None = None\n\n    def open(self) -> None:\n'),
+    ('app/camera.py',
+     '        if s.camera_num >= len(cameras):\n            raise CameraError(f"camera {s.camera_num} not detected ({len(cameras)} camera(s) found)")\n        try:\n            self.picam2 = Picamera2(s.camera_num)\n        except (RuntimeError, IndexError) as exc:\n            reason = str(exc).rstrip(".")\n',
+     '        if s.camera_num >= len(cameras):\n            raise CameraError(f"camera {s.camera_num} not detected ({len(cameras)} camera(s) found)")\n        tuning = None\n        if s.tuning_file:\n            try:\n                tuning = Picamera2.load_tuning_file(s.tuning_file)\n            except (RuntimeError, OSError, ValueError) as exc:\n                raise CameraError(f"cannot load tuning file {s.tuning_file}: {exc}") from exc\n        try:\n            self.picam2 = Picamera2(s.camera_num, tuning=tuning)\n        except (RuntimeError, IndexError) as exc:\n            reason = str(exc).rstrip(".")\n'),
+    ('app/camera.py',
+     '            raise CameraError(f"cannot configure camera: {exc}") from exc\n\n        model = self.picam2.camera_properties.get("Model", "unknown")\n        log.info("Opened %s: main %dx%d, lores %dx%d, %g fps, sensor mode %s", model, s.width, s.height,\n                 s.lores_width, s.lores_height, s.framerate,\n                 f"{sensor_size[0]}x{sensor_size[1]}" if sensor_size else "auto")\n\n    def _matching_sensor_size(self, size: tuple[int, int]) -> tuple[int, int] | None:\n',
+     '            raise CameraError(f"cannot configure camera: {exc}") from exc\n\n        self.model = self.picam2.camera_properties.get("Model", "unknown")\n        log.info("Opened %s: main %dx%d, lores %dx%d, %g fps, sensor mode %s%s", self.model, s.width, s.height,\n                 s.lores_width, s.lores_height, s.framerate,\n                 f"{sensor_size[0]}x{sensor_size[1]}" if sensor_size else "auto",\n                 f", tuning {s.tuning_file}" if s.tuning_file else "")\n\n    def _matching_sensor_size(self, size: tuple[int, int]) -> tuple[int, int] | None:\n'),
     ('app/config.py',
-     '\n@dataclass(frozen=True)\nclass WebSettings:\n    host: str = "127.0.0.1"\n',
-     '\n@dataclass(frozen=True)\nclass AuthSettings:\n    idle_timeout_minutes: int = 30\n    session_max_hours: int = 12\n    lockout_threshold: int = 5\n\n    def validate(self) -> None:\n        _check_range("auth.idle_timeout_minutes", self.idle_timeout_minutes, 5, 1440)\n        _check_range("auth.session_max_hours", self.session_max_hours, 1, 168)\n        _check_range("auth.lockout_threshold", self.lockout_threshold, 3, 20)\n\n\n@dataclass(frozen=True)\nclass WebSettings:\n    host: str = "127.0.0.1"\n'),
+     'MAX_ENCODER_PIXELS = 1920 * 1080\nCAMERA_NAME_PATTERN = re.compile(r"^[\\w][\\w .,\'()-]{0,39}$")\n\n\n',
+     'MAX_ENCODER_PIXELS = 1920 * 1080\nCAMERA_NAME_PATTERN = re.compile(r"^[\\w][\\w .,\'()-]{0,39}$")\nTUNING_FILE_PATTERN = re.compile(r"^[a-z0-9_]{1,40}\\.json$")\n\n\n'),
     ('app/config.py',
-     '    motion: MotionSettings = field(default_factory=MotionSettings)\n    live: LiveSettings = field(default_factory=LiveSettings)\n    web: WebSettings = field(default_factory=WebSettings)\n    paths: PathSettings = field(default_factory=PathSettings)\n',
-     '    motion: MotionSettings = field(default_factory=MotionSettings)\n    live: LiveSettings = field(default_factory=LiveSettings)\n    auth: AuthSettings = field(default_factory=AuthSettings)\n    web: WebSettings = field(default_factory=WebSettings)\n    paths: PathSettings = field(default_factory=PathSettings)\n'),
+     '    keyframe_seconds: float = 2.0\n    rotate180: bool = False\n\n    def validate(self) -> None:\n        _check_range("camera.camera_num", self.camera_num, 0, 3)\n        if not CAMERA_NAME_PATTERN.match(self.name):\n            raise ConfigError("camera.name must be 1-40 letters, digits, spaces or . , \' ( ) - _")\n',
+     '    keyframe_seconds: float = 2.0\n    rotate180: bool = False\n    tuning_file: str = ""   # e.g. "ov5647_noir.json" for cameras without an infrared filter\n\n    def validate(self) -> None:\n        _check_range("camera.camera_num", self.camera_num, 0, 3)\n        if self.tuning_file and not TUNING_FILE_PATTERN.match(self.tuning_file):\n            raise ConfigError("camera.tuning_file must be empty or a file name like ov5647_noir.json")\n        if not CAMERA_NAME_PATTERN.match(self.name):\n            raise ConfigError("camera.name must be 1-40 letters, digits, spaces or . , \' ( ) - _")\n'),
+    ('app/config.py',
+     '\n\ndef save_settings(settings: Settings, path: Path = DEFAULT_CONFIG_PATH) -> None:\n    settings.validate()\n',
+     '\n\ndef diff_settings(old: Settings, new: Settings) -> list[tuple[str, Any, Any]]:\n    """[("section.name", old_value, new_value), ...] for every value that differs."""\n    changes = []\n    old_data, new_data = asdict(old), asdict(new)\n    for section, values in new_data.items():\n        for name, value in values.items():\n            if old_data[section][name] != value:\n                changes.append((f"{section}.{name}", old_data[section][name], value))\n    return changes\n\n\ndef save_settings(settings: Settings, path: Path = DEFAULT_CONFIG_PATH) -> None:\n    settings.validate()\n'),
+    ('app/main.py',
+     'from app.camera import CameraError  # noqa: E402\nfrom app.clock import ClockMonitor  # noqa: E402\nfrom app.config import DEFAULT_CONFIG_PATH, ConfigError, Settings, load_settings  # noqa: E402\nfrom app.database import Database  # noqa: E402\nfrom app.logging_setup import setup_logging  # noqa: E402\n',
+     'from app.camera import CameraError  # noqa: E402\nfrom app.clock import ClockMonitor  # noqa: E402\nfrom app.config import DEFAULT_CONFIG_PATH, ConfigError, Settings, diff_settings, load_settings  # noqa: E402\nfrom app.database import Database  # noqa: E402\nfrom app.logging_setup import setup_logging  # noqa: E402\n'),
+    ('app/main.py',
+     'BACKOFF_MAX_S = 60\nHEALTHY_RESET_S = 120\n\n\n',
+     'BACKOFF_MAX_S = 60\nHEALTHY_RESET_S = 120\nSETTINGS_CHECK_S = 5.0\nRECORDER_SECTIONS = {"camera", "recording", "storage", "motion", "live", "paths", "logging"}\n\n\n'),
+    ('app/main.py',
+     '\n    stop = threading.Event()\n\n    def request_stop(signum, _frame) -> None:\n        if not stop.is_set():\n            log.info("Received %s, stopping", signal.Signals(signum).name)\n        stop.set()\n\n',
+     '\n    stop = threading.Event()\n    terminate = threading.Event()\n\n    def request_stop(signum, _frame) -> None:\n        if not terminate.is_set():\n            log.info("Received %s, stopping", signal.Signals(signum).name)\n        terminate.set()\n        stop.set()\n\n'),
+    ('app/main.py',
+     '\n    try:\n        run(settings, stop)\n    except Exception:  # noqa: BLE001 - log it; systemd restarts the service\n        log.exception("Fatal error")\n',
+     '\n    try:\n        while True:\n            watcher = SettingsWatcher(args.config, settings, stop)\n            watcher.start()\n            try:\n                run(settings, stop)\n            finally:\n                watcher.stop()\n            if terminate.is_set() or watcher.new_settings is None:\n                break\n            settings = watcher.new_settings\n            stop.clear()\n            setup_logging(settings.logging, settings.log_dir)\n            log.info("Recorder restarting with the new settings")\n    except Exception:  # noqa: BLE001 - log it; systemd restarts the service\n        log.exception("Fatal error")\n'),
+    ('app/main.py',
+     '\n\nif __name__ == "__main__":\n    sys.exit(main())\n',
+     '\n\nclass SettingsWatcher:\n    """Restarts the recording pipeline when the settings file changes (e.g. saved from the web page).\n\n    An invalid file is logged and ignored. Changes that only affect the web interface\n    (web.*, auth.*) do not interrupt recording.\n    """\n\n    def __init__(self, path: Path, current: Settings, stop: threading.Event) -> None:\n        self._path = path\n        self._current = current\n        self._stop_recorder = stop\n        self._halt = threading.Event()\n        self._signature = self._file_signature()\n        self._thread = threading.Thread(target=self._run, name="settings-watcher", daemon=True)\n        self.new_settings: Settings | None = None\n\n    def _file_signature(self) -> tuple[int, int] | None:\n        try:\n            st = self._path.stat()\n        except OSError:\n            return None\n        return st.st_mtime_ns, st.st_size\n\n    def start(self) -> None:\n        self._thread.start()\n\n    def stop(self) -> None:\n        self._halt.set()\n        if self._thread.is_alive():\n            self._thread.join(timeout=10)\n\n    def _run(self) -> None:\n        while not self._halt.wait(SETTINGS_CHECK_S):\n            signature = self._file_signature()\n            if signature is None or signature == self._signature:\n                continue\n            self._signature = signature\n            try:\n                new, _ = load_settings(self._path, create_if_missing=False)\n            except ConfigError as exc:\n                log.error("The settings file changed but is invalid (%s); keeping the current settings", exc)\n                continue\n            changes = [key for key, _old, _new in diff_settings(self._current, new)]\n            recorder_changes = [key for key in changes if key.split(".")[0] in RECORDER_SECTIONS]\n            if not recorder_changes:\n                if changes:\n                    log.info("Settings changed (%s); recording is not affected", ", ".join(changes))\n                self._current = new\n                continue\n            log.info("Settings changed (%s); restarting the recording pipeline", ", ".join(recorder_changes))\n            self.new_settings = new\n            self._stop_recorder.set()\n            return\n\n\nif __name__ == "__main__":\n    sys.exit(main())\n'),
+    ('app/recorder.py',
+     '        return bool(self._output and self._output.paused)\n\n    def _boundary_loop(self, encoder: H264Encoder) -> None:\n        """Request a keyframe at each boundary so segments start on time, not up to 2 s late."""\n',
+     '        return bool(self._output and self._output.paused)\n\n    @property\n    def camera_model(self) -> str | None:\n        return self._camera.model if self._camera else None\n\n    def _boundary_loop(self, encoder: H264Encoder) -> None:\n        """Request a keyframe at each boundary so segments start on time, not up to 2 s late."""\n'),
+    ('app/status.py',
+     '            "recorder": {"phase": self._state.phase, "message": self._state.message},\n            "camera": {"name": cam.name, "resolution": f"{cam.width}x{cam.height}", "fps": cam.framerate,\n                       "bitrate": cam.bitrate},\n            "recording": {\n                "active": recording and not recorder.paused,\n',
+     '            "recorder": {"phase": self._state.phase, "message": self._state.message},\n            "camera": {"name": cam.name, "resolution": f"{cam.width}x{cam.height}", "fps": cam.framerate,\n                       "bitrate": cam.bitrate, "model": recorder.camera_model if recorder else None,\n                       "tuning_file": cam.tuning_file},\n            "recording": {\n                "active": recording and not recorder.paused,\n'),
     ('app/web.py',
-     'from app.status import read_status\nfrom app.system_info import SystemInfo\nfrom app.web_live import create_blueprint as create_live_blueprint\nfrom app.web_recordings import create_blueprint\n',
-     'from app.status import read_status\nfrom app.system_info import SystemInfo\nfrom app.web_auth import install as install_auth\nfrom app.web_live import create_blueprint as create_live_blueprint\nfrom app.web_recordings import create_blueprint\n'),
+     'import sqlite3\nimport time\nfrom dataclasses import asdict\nfrom datetime import datetime\n\nfrom flask import Flask, abort, jsonify, render_template, request\n\nfrom app import __version__\nfrom app.config import PROJECT_ROOT, Settings\nfrom app.database import DB_FILE_NAME, connect\nfrom app.status import read_status\n',
+     'import sqlite3\nimport time\nfrom datetime import datetime\nfrom pathlib import Path\n\nfrom flask import Flask, abort, jsonify, render_template, request\n\nfrom app import __version__\nfrom app.config import DEFAULT_CONFIG_PATH, PROJECT_ROOT, Settings\nfrom app.database import DB_FILE_NAME, connect\nfrom app.status import read_status\n'),
     ('app/web.py',
-     '    "X-Content-Type-Options": "nosniff",\n    "X-Frame-Options": "DENY",\n    "Referrer-Policy": "no-referrer",\n    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",\n    "Cross-Origin-Opener-Policy": "same-origin",\n',
-     '    "X-Content-Type-Options": "nosniff",\n    "X-Frame-Options": "DENY",\n    # same-origin (not no-referrer): with no-referrer browsers send "Origin: null" on form posts,\n    # which would defeat the same-origin check that protects every POST.\n    "Referrer-Policy": "same-origin",\n    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",\n    "Cross-Origin-Opener-Policy": "same-origin",\n'),
+     'from app.web_auth import install as install_auth\nfrom app.web_live import create_blueprint as create_live_blueprint\nfrom app.web_recordings import create_blueprint\n\n',
+     'from app.web_auth import install as install_auth\nfrom app.web_live import create_blueprint as create_live_blueprint\nfrom app.web_settings import create_blueprint as create_settings_blueprint\nfrom app.web_recordings import create_blueprint\n\n'),
     ('app/web.py',
-     '            abort(400)\n\n    @app.after_request\n    def security_headers(response):\n',
-     '            abort(400)\n\n    # Registered after the Host check, so it runs second: login, CSRF and same-origin checks.\n    install_auth(app, settings)\n\n    @app.after_request\n    def security_headers(response):\n'),
-    ('web/templates/base.html',
-     '  <meta charset="utf-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1">\n  <meta name="referrer" content="no-referrer">\n  <link rel="icon" href="data:,">\n  <title>{{ title }} · {{ camera_name }}</title>\n',
-     '  <meta charset="utf-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1">\n  <meta name="referrer" content="same-origin">\n  <link rel="icon" href="data:,">\n  <title>{{ title }} · {{ camera_name }}</title>\n'),
-    ('web/templates/base.html',
-     '  {% block scripts %}{% endblock %}\n</head>\n<body data-refresh="{{ refresh_ms }}">\n  <header class="topbar">\n    <div class="brand">\n',
-     '  {% block scripts %}{% endblock %}\n</head>\n<body data-refresh="{{ refresh_ms }}" data-auth="{{ \'1\' if current_user else \'0\' }}">\n  <header class="topbar">\n    <div class="brand">\n'),
-    ('web/templates/base.html',
-     '      </div>\n    </div>\n    <p class="clock" id="updated-at" aria-live="polite">connecting…</p>\n  </header>\n  <nav class="nav" aria-label="Main">\n    {% for endpoint, label in navigation %}\n      <a href="{{ url_for(endpoint) }}" {% if page == endpoint %}class="active" aria-current="page"{% endif %}>{{ label }}</a>\n    {% endfor %}\n  </nav>\n  <div class="banner" id="connection-banner" role="alert" hidden>Cannot reach the camera. Retrying…</div>\n  <main>\n',
-     '      </div>\n    </div>\n    {% if current_user %}<p class="clock" id="updated-at" aria-live="polite">connecting…</p>{% endif %}\n  </header>\n  {% if current_user %}\n  <nav class="nav" aria-label="Main">\n    {% for endpoint, label in navigation %}\n      <a href="{{ url_for(endpoint) }}" {% if page == endpoint %}class="active" aria-current="page"{% endif %}>{{ label }}</a>\n    {% endfor %}\n    <span class="nav-spacer"></span>\n    <a href="{{ url_for(\'auth.account\') }}" {% if page == \'auth.account\' %}class="active" aria-current="page"{% endif %}>{{ current_user }}</a>\n    <form method="post" action="{{ url_for(\'auth.logout\') }}" class="nav-form">\n      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">\n      <button type="submit" class="nav-button">Log out</button>\n    </form>\n  </nav>\n  {% endif %}\n  <div class="banner" id="connection-banner" role="alert" hidden>Cannot reach the camera. Retrying…</div>\n  <main>\n'),
-    ('web/static/app.js',
-     '// Only textContent is ever set, so nothing from the server can be interpreted as HTML.\n(() => {\n  const refreshMs = Number(document.body.dataset.refresh) || 5000;\n  let timer = null;\n',
-     '// Only textContent is ever set, so nothing from the server can be interpreted as HTML.\n(() => {\n  if (document.body.dataset.auth !== "1") return;   // login page: nothing to poll\n  const refreshMs = Number(document.body.dataset.refresh) || 5000;\n  let timer = null;\n'),
-    ('web/static/app.js',
-     '    try {\n      const response = await fetch("/api/status", { cache: "no-store", credentials: "same-origin" });\n      if (!response.ok) throw new Error(`HTTP ${response.status}`);\n      render(await response.json());\n',
-     '    try {\n      const response = await fetch("/api/status", { cache: "no-store", credentials: "same-origin" });\n      if (response.status === 401) {   // session expired or logged out elsewhere\n        window.location.href = `/login?msg=expired&next=${encodeURIComponent(location.pathname + location.search)}`;\n        return;\n      }\n      if (!response.ok) throw new Error(`HTTP ${response.status}`);\n      render(await response.json());\n'),
+     '    ("rec.events", "Motion Events"),\n    ("storage", "Storage"),\n    ("settings_page", "Settings"),\n    ("system", "System Status"),\n]\n',
+     '    ("rec.events", "Motion Events"),\n    ("storage", "Storage"),\n    ("cfg.settings_page", "Settings"),\n    ("system", "System Status"),\n]\n'),
+    ('app/web.py',
+     '\n\ndef create_app(settings: Settings) -> Flask:\n    app = Flask(__name__, template_folder=str(TEMPLATE_DIR), static_folder=str(STATIC_DIR))\n    app.config.update(JSON_SORT_KEYS=False, MAX_CONTENT_LENGTH=64 * 1024)\n',
+     '\n\ndef create_app(settings: Settings, config_path: Path = DEFAULT_CONFIG_PATH) -> Flask:\n    app = Flask(__name__, template_folder=str(TEMPLATE_DIR), static_folder=str(STATIC_DIR))\n    app.config.update(JSON_SORT_KEYS=False, MAX_CONTENT_LENGTH=64 * 1024)\n'),
+    ('app/web.py',
+     '\n    # Registered after the Host check, so it runs second: login, CSRF and same-origin checks.\n    install_auth(app, settings)\n\n    @app.after_request\n',
+     '\n    # Registered after the Host check, so it runs second: login, CSRF and same-origin checks.\n    store = install_auth(app, settings)\n    app.register_blueprint(create_settings_blueprint(settings, config_path, store))\n\n    @app.after_request\n'),
+    ('app/web.py',
+     '                               recordings_dir=settings.recordings_dir)\n\n    @app.get("/settings")\n    def settings_page():\n        return render_template("settings.html", title="Settings", page="settings_page", sections=asdict(settings))\n\n    @app.get("/api/status")\n    def api_status():\n',
+     '                               recordings_dir=settings.recordings_dir)\n\n    @app.get("/api/status")\n    def api_status():\n'),
+    ('app/web_main.py',
+     '    host, port = settings.web.host, settings.web.port\n    log.info("Web interface %s listening on http://%s:%d (local only)", __version__, host, port)\n    serve(create_app(settings), host=host, port=port, threads=settings.live.max_viewers + SPARE_WORKER_THREADS,\n          ident="", clear_untrusted_proxy_headers=True)\n    return 0\n',
+     '    host, port = settings.web.host, settings.web.port\n    log.info("Web interface %s listening on http://%s:%d (local only)", __version__, host, port)\n    serve(create_app(settings, args.config), host=host, port=port, threads=settings.live.max_viewers + SPARE_WORKER_THREADS,\n          ident="", clear_untrusted_proxy_headers=True)\n    return 0\n'),
     ('web/static/style.css',
-     '  letter-spacing: .05em;\n}\n',
-     '  letter-spacing: .05em;\n}\n\n/* ---- Phase 11: login and account ---- */\n.nav { align-items: center; }\n.nav-spacer { flex: 1; }\n.nav-form { margin: 0; }\n.nav-button {\n  padding: .45rem .8rem;\n  border: 0;\n  border-radius: 8px;\n  background: none;\n  color: var(--muted);\n  font: inherit;\n  font-size: .9rem;\n  cursor: pointer;\n}\n.nav-button:hover { color: var(--text); background: var(--panel-2); }\n\n.login-panel { max-width: 420px; width: 100%; margin: 2rem auto; }\nform.stack { display: grid; gap: .9rem; }\nform.stack.narrow { max-width: 420px; }\nform.stack label { display: grid; gap: .3rem; color: var(--muted); font-size: .85rem; }\nform.stack input[type="text"], form.stack input[type="password"] {\n  padding: .6rem .7rem;\n  border: 1px solid var(--border);\n  border-radius: 8px;\n  background: var(--bg);\n  color: var(--text);\n  font: inherit;\n  font-size: 1rem;\n}\nform.stack input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }\n'),
+     '}\nform.stack input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }\n',
+     '}\nform.stack input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }\n\n/* ---- Phase 11b: settings form ---- */\n.settings-form { display: grid; gap: 1rem; }\n.field { display: grid; gap: .3rem; padding: .55rem 0; border-bottom: 1px solid var(--border); }\n.field > label { color: var(--text); font-size: .9rem; }\n.field input[type="text"], .field input[type="number"], .field input[type="password"], .field select {\n  padding: .45rem .55rem;\n  border: 1px solid var(--border);\n  border-radius: 8px;\n  background: var(--bg);\n  color: var(--text);\n  font: inherit;\n  width: 100%;\n}\n.field input:focus, .field select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }\n.help { margin: 0; color: var(--muted); font-size: .8rem; }\n.error-box { border-left-color: var(--bad); color: var(--text); }\n.notice ul { margin: .4rem 0 0; padding-left: 1.2rem; }\n.save-bar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 1rem; position: sticky; bottom: 0; }\n.save-bar .field { border: 0; flex: 1; min-width: 240px; }\n'),
 ]
 
 texts = {}
 for rel, old, new in EDITS:
     text = texts.setdefault(rel, Path(rel).read_text())
     if text.count(old) != 1:
-        sys.exit(f"ABORTED, nothing changed: {rel} does not match the expected 0.10.0 code "
+        sys.exit(f"ABORTED, nothing changed: {rel} does not match the expected 0.11.0 code "
                  f"(found {text.count(old)} matches for:\n{old})")
     texts[rel] = text.replace(old, new)
 for rel, text in texts.items():
     shutil.copy2(rel, rel + ".bak")
     Path(rel).write_text(text)
     print(f"updated {rel}  (backup: {rel}.bak)")
-print("Update to 0.11.0 complete.")
+print("Update to 0.11.1 complete.")
 EOF
-python3 update_to_0_11_0.py
+python3 update_to_0_11_1.py
 ```
 
-**2. New file `app/auth.py`:**
+It should print ten `updated …` lines and then `Update to 0.11.1 complete.`
+
+**2. New file `app/web_settings.py`:**
 
 ```bash
-cat > ~/surveillance/app/auth.py <<'EOF'
-"""Accounts, password hashing, sessions, brute-force protection and the audit log (Phase 11).
+cat > ~/surveillance/app/web_settings.py <<'EOF'
+"""Editable settings page (Phase 11b).
 
-Design:
-  * Passwords are hashed with Argon2id (RFC 9106 low-memory profile: 64 MiB, 3 passes, 4 lanes).
-  * At most two hashes are computed at once, so a flood of login attempts cannot exhaust RAM.
-  * Unknown usernames are checked against a dummy hash, so response time does not reveal
-    which usernames exist.
-  * Failed logins lock the attempted username with a growing delay, whether or not the account
-    exists (so the lockout message cannot reveal real usernames); a global cap limits guessing
-    across all usernames. Counters are stored in the database, so a restart does not reset them.
-  * Session tokens are 256-bit random values. Only their SHA-256 is stored, so a copy of the
-    database does not contain usable sessions.
-  * Sessions end after an idle period and after a maximum age; changing the password ends all
-    other sessions.
+* Every submitted value is parsed by its field type, choices are checked against the allowed list
+  (never trusted from the browser), and the result goes through the same validation as the
+  settings file, so the web page can never save something the recorder would reject.
+* Saving requires the account password, unless it was confirmed in the last few minutes.
+* The file is written atomically; the recorder notices the change and restarts its pipeline,
+  and this web process restarts itself so it uses the new values too.
+* Paths, network address and log file details are deliberately not editable from the browser.
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
-import re
-import secrets
-import sqlite3
-import threading
-import time
-from contextlib import closing
-from pathlib import Path
-
-from argon2 import PasswordHasher
-from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
-
-log = logging.getLogger("Auth")
-
-AUTH_DB_NAME = "auth.db"
-MIN_PASSWORD_LENGTH = 15
-MAX_PASSWORD_LENGTH = 256
-USERNAME_RE = re.compile(r"^[a-z][a-z0-9_.-]{2,31}$")
-TOKEN_BYTES = 32
-MAX_SESSIONS_PER_USER = 10
-SEEN_UPDATE_S = 60
-GLOBAL_WINDOW_S = 600
-GLOBAL_MAX_FAILURES = 30
-LOCK_BASE_S = 30
-LOCK_MAX_S = 900
-HASH_SLOT_WAIT_S = 10
-AUDIT_KEPT = 5000
-LOCKOUT_FORGET_S = 86400
-
-COMMON_PASSWORDS = {
-    "password", "passwordpassword", "password123456", "123456789012345", "1234567890123456",
-    "qwertyuiopasdfg", "qwertyuiopasdfgh", "iloveyouiloveyou", "adminadminadmin", "administrator123",
-    "letmeinletmein", "welcomewelcome1", "raspberrypi1234", "raspberrypiraspberrypi", "changemechangeme",
-    "correcthorsebatterystaple", "trustno1trustno1", "1q2w3e4r5t6y7u8i", "aaaaaaaaaaaaaaa",
-}
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    id                  INTEGER PRIMARY KEY,
-    username            TEXT NOT NULL UNIQUE,
-    password_hash       TEXT NOT NULL,
-    created_at          INTEGER NOT NULL,
-    password_changed_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS sessions (
-    token_hash  TEXT PRIMARY KEY,
-    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    csrf_token  TEXT NOT NULL,
-    created_at  INTEGER NOT NULL,
-    last_seen   INTEGER NOT NULL,
-    reauth_at   INTEGER NOT NULL,
-    user_agent  TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
-CREATE TABLE IF NOT EXISTS login_failures (at INTEGER NOT NULL);
--- Keyed by the attempted username, existing or not.
-CREATE TABLE IF NOT EXISTS lockouts (
-    username      TEXT PRIMARY KEY,
-    failed        INTEGER NOT NULL,
-    locked_until  INTEGER NOT NULL,
-    updated_at    INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS audit_log (
-    id        INTEGER PRIMARY KEY,
-    at        INTEGER NOT NULL,
-    username  TEXT,
-    action    TEXT NOT NULL,
-    detail    TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log(at);
-"""
-
-
-class AuthError(ValueError):
-    pass
-
-
-def hash_token(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
-
-
-def normalize_username(username: str) -> str:
-    return username.strip().lower()
-
-
-def safe_label(text: str) -> str:
-    """For the audit log: keep attempted usernames short and printable."""
-    return re.sub(r"[^a-z0-9_.@-]", "?", text.lower())[:32]
-
-
-def password_problem(password: str, username: str) -> str | None:
-    if len(password) < MIN_PASSWORD_LENGTH:
-        return f"The password must be at least {MIN_PASSWORD_LENGTH} characters long (a passphrase works well)."
-    if len(password) > MAX_PASSWORD_LENGTH:
-        return f"The password must be at most {MAX_PASSWORD_LENGTH} characters long."
-    lowered = password.lower()
-    if lowered in COMMON_PASSWORDS or len(set(lowered)) < 5:
-        return "That password is too easy to guess."
-    if username and username.lower() in lowered:
-        return "The password must not contain the username."
-    return None
-
-
-class AuthStore:
-    def __init__(self, path: Path, idle_minutes: int, session_hours: int, lockout_threshold: int) -> None:
-        self.path = path
-        self._idle_s = idle_minutes * 60
-        self._max_age_s = session_hours * 3600
-        self._lock_threshold = lockout_threshold
-        self._hasher = PasswordHasher()
-        self._dummy_hash = self._hasher.hash(secrets.token_hex(16))
-        self._hash_slots = threading.BoundedSemaphore(2)
-
-    # ---------------------------------------------------------------- storage
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=5, isolation_level=None)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def init(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        old_umask = os.umask(0o077)  # auth.db and its WAL files are owner-only
-        try:
-            with closing(self._connect()) as conn:
-                conn.executescript(SCHEMA)
-        finally:
-            os.umask(old_umask)
-        os.chmod(self.path, 0o600)
-
-    def audit(self, conn: sqlite3.Connection, username: str | None, action: str, detail: str = "") -> None:
-        conn.execute("INSERT INTO audit_log (at, username, action, detail) VALUES (?, ?, ?, ?)",
-                     (int(time.time()), username, action, detail[:200]))
-        conn.execute("DELETE FROM audit_log WHERE id <= (SELECT MAX(id) FROM audit_log) - ?", (AUDIT_KEPT,))
-
-    def record(self, username: str | None, action: str, detail: str = "") -> None:
-        with closing(self._connect()) as conn:
-            self.audit(conn, username, action, detail)
-
-    # ---------------------------------------------------------------- hashing
-    def _verify(self, password_hash: str, password: str) -> bool:
-        if not self._hash_slots.acquire(timeout=HASH_SLOT_WAIT_S):
-            raise AuthError("The camera is busy. Try again in a moment.")
-        try:
-            self._hasher.verify(password_hash, password)
-            return True
-        except (VerifyMismatchError, VerificationError, InvalidHashError):
-            return False
-        finally:
-            self._hash_slots.release()
-
-    # ------------------------------------------------------------------ users
-    def user_count(self) -> int:
-        with closing(self._connect()) as conn:
-            return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-
-    def list_users(self) -> list[sqlite3.Row]:
-        with closing(self._connect()) as conn:
-            return conn.execute("SELECT u.id, u.username, u.created_at, u.password_changed_at,"
-                                " COALESCE(l.failed, 0) AS failed_logins, COALESCE(l.locked_until, 0) AS locked_until,"
-                                " (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id) AS sessions"
-                                " FROM users u LEFT JOIN lockouts l ON l.username = u.username"
-                                " ORDER BY u.username").fetchall()
-
-    def create_user(self, username: str, password: str) -> None:
-        username = normalize_username(username)
-        if not USERNAME_RE.match(username):
-            raise AuthError("Usernames are 3-32 characters: lowercase letters, digits, and . _ - (starting with a letter).")
-        problem = password_problem(password, username)
-        if problem:
-            raise AuthError(problem)
-        now = int(time.time())
-        with closing(self._connect()) as conn:
-            try:
-                conn.execute("INSERT INTO users (username, password_hash, created_at, password_changed_at)"
-                             " VALUES (?, ?, ?, ?)", (username, self._hasher.hash(password), now, now))
-            except sqlite3.IntegrityError:
-                raise AuthError(f"User {username} already exists.") from None
-            self.audit(conn, username, "user_created")
-
-    def set_password(self, username: str, password: str, actor: str = "cli") -> None:
-        username = normalize_username(username)
-        problem = password_problem(password, username)
-        if problem:
-            raise AuthError(problem)
-        with closing(self._connect()) as conn:
-            updated = conn.execute("UPDATE users SET password_hash = ?, password_changed_at = ? WHERE username = ?",
-                                   (self._hasher.hash(password), int(time.time()), username)).rowcount
-            if not updated:
-                raise AuthError(f"No user called {username}.")
-            conn.execute("DELETE FROM lockouts WHERE username = ?", (username,))
-            conn.execute("DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = ?)", (username,))
-            self.audit(conn, username, "password_changed", f"by {actor}; all sessions ended")
-
-    def unlock(self, username: str | None = None) -> None:
-        with closing(self._connect()) as conn:
-            if username:
-                conn.execute("DELETE FROM lockouts WHERE username = ?", (normalize_username(username),))
-            else:
-                conn.execute("DELETE FROM lockouts")
-            conn.execute("DELETE FROM login_failures")
-            self.audit(conn, username, "unlocked", "by cli")
-
-    # ------------------------------------------------------------------ login
-    def authenticate(self, username: str, password: str, user_agent: str) -> tuple[str | None, str | None]:
-        """Return (session_token, None) on success or (None, message for the user)."""
-        name = normalize_username(username)[:64]
-        password = password[:MAX_PASSWORD_LENGTH]
-        now = int(time.time())
-        with closing(self._connect()) as conn:
-            recent = conn.execute("SELECT COUNT(*) FROM login_failures WHERE at > ?",
-                                  (now - GLOBAL_WINDOW_S,)).fetchone()[0]
-            if recent >= GLOBAL_MAX_FAILURES:
-                self.audit(conn, safe_label(name), "login_blocked", "too many failures on all accounts")
-                return None, "Too many failed logins recently. Try again in a few minutes."
-            lock = conn.execute("SELECT * FROM lockouts WHERE username = ?", (name,)).fetchone()
-            if lock and lock["locked_until"] > now:
-                minutes = max(1, round((lock["locked_until"] - now) / 60))
-                self.audit(conn, safe_label(name), "login_blocked", "username locked")
-                return None, f"Too many failed attempts. Try again in about {minutes} minute(s)."
-            user = conn.execute("SELECT * FROM users WHERE username = ?", (name,)).fetchone()
-
-        try:
-            ok = self._verify(user["password_hash"] if user else self._dummy_hash, password) and user is not None
-        except AuthError as exc:
-            return None, str(exc)
-
-        with closing(self._connect()) as conn:
-            if not ok:
-                conn.execute("INSERT INTO login_failures (at) VALUES (?)", (now,))
-                conn.execute("DELETE FROM login_failures WHERE at <= ?", (now - GLOBAL_WINDOW_S,))
-                failed = (lock["failed"] if lock else 0) + 1
-                locked_until = 0
-                if failed >= self._lock_threshold:
-                    locked_until = now + min(LOCK_MAX_S, LOCK_BASE_S * 2 ** (failed - self._lock_threshold))
-                conn.execute("INSERT INTO lockouts (username, failed, locked_until, updated_at) VALUES (?, ?, ?, ?)"
-                             " ON CONFLICT(username) DO UPDATE SET failed = excluded.failed,"
-                             " locked_until = excluded.locked_until, updated_at = excluded.updated_at",
-                             (name, failed, locked_until, now))
-                conn.execute("DELETE FROM lockouts WHERE updated_at < ? AND locked_until < ?",
-                             (now - LOCKOUT_FORGET_S, now))
-                self.audit(conn, safe_label(name), "login_failed")
-                log.warning("Failed login for %r", safe_label(name))
-                return None, "Wrong username or password."
-
-            conn.execute("DELETE FROM lockouts WHERE username = ?", (name,))
-            if self._hasher.check_needs_rehash(user["password_hash"]):
-                conn.execute("UPDATE users SET password_hash = ? WHERE id = ?",
-                             (self._hasher.hash(password), user["id"]))
-            token = self._new_session(conn, user["id"], user_agent)
-            self.audit(conn, name, "login")
-            log.info("User %s logged in", name)
-            return token, None
-
-    def _new_session(self, conn: sqlite3.Connection, user_id: int, user_agent: str) -> str:
-        token = secrets.token_urlsafe(TOKEN_BYTES)
-        now = int(time.time())
-        conn.execute("INSERT INTO sessions (token_hash, user_id, csrf_token, created_at, last_seen, reauth_at,"
-                     " user_agent) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                     (hash_token(token), user_id, secrets.token_urlsafe(TOKEN_BYTES), now, now, now,
-                      user_agent[:200]))
-        conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash NOT IN (SELECT token_hash FROM sessions"
-                     " WHERE user_id = ? ORDER BY created_at DESC LIMIT ?)", (user_id, user_id, MAX_SESSIONS_PER_USER))
-        return token
-
-    # --------------------------------------------------------------- sessions
-    def get_session(self, token: str) -> dict | None:
-        if not token or len(token) > 100:
-            return None
-        now = int(time.time())
-        with closing(self._connect()) as conn:
-            row = conn.execute("SELECT s.*, u.username FROM sessions s JOIN users u ON u.id = s.user_id"
-                               " WHERE s.token_hash = ?", (hash_token(token),)).fetchone()
-            if row is None:
-                return None
-            if now - row["last_seen"] > self._idle_s or now - row["created_at"] > self._max_age_s:
-                conn.execute("DELETE FROM sessions WHERE token_hash = ?", (row["token_hash"],))
-                return None
-            if now - row["last_seen"] >= SEEN_UPDATE_S:
-                conn.execute("UPDATE sessions SET last_seen = ? WHERE token_hash = ?", (now, row["token_hash"]))
-            return dict(row)
-
-    def logout(self, session: dict) -> None:
-        with closing(self._connect()) as conn:
-            conn.execute("DELETE FROM sessions WHERE token_hash = ?", (session["token_hash"],))
-            self.audit(conn, session["username"], "logout")
-
-    def logout_others(self, session: dict) -> int:
-        with closing(self._connect()) as conn:
-            ended = conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?",
-                                 (session["user_id"], session["token_hash"])).rowcount
-            self.audit(conn, session["username"], "logout_others", f"{ended} session(s) ended")
-            return ended
-
-    def logout_all(self, username: str) -> int:
-        with closing(self._connect()) as conn:
-            ended = conn.execute("DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = ?)",
-                                 (normalize_username(username),)).rowcount
-            self.audit(conn, normalize_username(username), "logout_all", f"by cli; {ended} session(s) ended")
-            return ended
-
-    def sessions_for(self, user_id: int) -> list[sqlite3.Row]:
-        with closing(self._connect()) as conn:
-            return conn.execute("SELECT token_hash, created_at, last_seen, user_agent FROM sessions"
-                                " WHERE user_id = ? ORDER BY last_seen DESC", (user_id,)).fetchall()
-
-    def change_password(self, session: dict, current: str, new: str) -> None:
-        with closing(self._connect()) as conn:
-            user = conn.execute("SELECT * FROM users WHERE id = ?", (session["user_id"],)).fetchone()
-        if not self._verify(user["password_hash"], current[:MAX_PASSWORD_LENGTH]):
-            self.record(user["username"], "password_change_failed", "wrong current password")
-            raise AuthError("The current password is wrong.")
-        problem = password_problem(new, user["username"])
-        if problem:
-            raise AuthError(problem)
-        with closing(self._connect()) as conn:
-            conn.execute("UPDATE users SET password_hash = ?, password_changed_at = ? WHERE id = ?",
-                         (self._hasher.hash(new), int(time.time()), user["id"]))
-            conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?",
-                         (user["id"], session["token_hash"]))
-            self.audit(conn, user["username"], "password_changed", "by web; other sessions ended")
-
-    def recent_audit(self, limit: int = 20) -> list[sqlite3.Row]:
-        with closing(self._connect()) as conn:
-            return conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-EOF
-```
-
-**3. New file `app/web_auth.py`:**
-
-```bash
-cat > ~/surveillance/app/web_auth.py <<'EOF'
-"""Login, logout, account page and the checks that protect every other page (Phase 11).
-
-Every request except the login page and static files needs a valid session:
-  * pages redirect to /login; API, video, download and live endpoints answer 401
-  * every POST must come from this site (Origin/Referer check) and carry the session's
-    CSRF token, so another website cannot make your browser perform actions here
-  * the session cookie is HttpOnly (invisible to JavaScript), Secure, SameSite=Strict and
-    uses the __Host- prefix, so it is never sent to other sites or sub-domains
-"""
-from __future__ import annotations
-
-import hmac
-import logging
-from datetime import datetime
-from urllib.parse import urlsplit
-
-from flask import Blueprint, abort, g, redirect, render_template, request, url_for
-
-from app.auth import AUTH_DB_NAME, AuthError, AuthStore
-from app.config import Settings
-
-log = logging.getLogger("Auth")
-
-COOKIE_NAME = "__Host-sid"
-PUBLIC_ENDPOINTS = {"auth.login", "auth.login_post", "static"}
-RESOURCE_ENDPOINTS = {"api_status", "live.stream", "live.snapshot", "rec.video", "rec.download"}
-SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
-MESSAGES = {
-    "password_changed": "Password changed. All your other sessions were logged out.",
-    "others_logged_out": "All other sessions were logged out.",
-    "logged_out": "You have been logged out.",
-    "expired": "Please log in.",
-}
-
-
-def safe_next(target: str | None) -> str:
-    """Only allow redirects to paths on this site (never //other.example or https://...)."""
-    if not target or not target.startswith("/") or target.startswith("//") or "\\" in target:
-        return url_for("dashboard")
-    return target
-
-
-def same_origin() -> bool:
-    for header in ("Origin", "Referer"):
-        value = request.headers.get(header)
-        if value:
-            return value != "null" and urlsplit(value).netloc == request.host
-    return False
-
-
-def install(app, settings: Settings) -> AuthStore:
-    auth = settings.auth
-    store = AuthStore(settings.database_dir / AUTH_DB_NAME, auth.idle_timeout_minutes,
-                      auth.session_max_hours, auth.lockout_threshold)
-    store.init()
-    bp = Blueprint("auth", __name__)
-
-    @app.before_request
-    def require_login():
-        g.session = None
-        token = request.cookies.get(COOKIE_NAME)
-        if token:
-            g.session = store.get_session(token)
-        if request.method not in SAFE_METHODS and not same_origin():
-            abort(403)
-        if request.endpoint in PUBLIC_ENDPOINTS:
-            return None
-        if g.session is None:
-            if request.endpoint in RESOURCE_ENDPOINTS or request.endpoint is None:
-                abort(401)
-            return redirect(url_for("auth.login", next=request.full_path.rstrip("?"), msg="expired"))
-        if request.method not in SAFE_METHODS:
-            sent = request.form.get("csrf_token") or request.headers.get("X-CSRF-Token", "")
-            if not hmac.compare_digest(sent, g.session["csrf_token"]):
-                abort(403)
-        return None
-
-    @app.context_processor
-    def auth_context() -> dict:
-        session = getattr(g, "session", None)
-        return {"current_user": session["username"] if session else None,
-                "csrf_token": session["csrf_token"] if session else ""}
-
-    @app.errorhandler(401)
-    def unauthorized(_error):
-        return "Login required", 401
-
-    @app.errorhandler(403)
-    def forbidden(_error):
-        return render_template("placeholder.html", title="Forbidden", page="", phase=None,
-                               text="This request was refused (it did not come from this page, or the form "
-                                    "expired). Go back, reload the page and try again."), 403
-
-    def set_session_cookie(response, token: str):
-        response.set_cookie(COOKIE_NAME, token, httponly=True, secure=True, samesite="Strict", path="/")
-        return response
-
-    @bp.get("/login")
-    def login():
-        if g.session:
-            return redirect(safe_next(request.args.get("next")))
-        return render_template("login.html", title="Log in", page="", next=request.args.get("next", ""),
-                               error=None, username="", message=MESSAGES.get(request.args.get("msg", "")),
-                               no_users=store.user_count() == 0)
-
-    @bp.post("/login")
-    def login_post():
-        username = request.form.get("username", "")[:64]
-        password = request.form.get("password", "")
-        target = request.form.get("next", "")
-        token, error = store.authenticate(username, password, request.headers.get("User-Agent", ""))
-        if error:
-            return render_template("login.html", title="Log in", page="", next=target, error=error,
-                                   username=username, message=None, no_users=store.user_count() == 0), 401
-        return set_session_cookie(redirect(safe_next(target)), token)
-
-    @bp.post("/logout")
-    def logout():
-        store.logout(g.session)
-        response = redirect(url_for("auth.login", msg="logged_out"))
-        response.delete_cookie(COOKIE_NAME, path="/", secure=True, httponly=True, samesite="Strict")
-        return response
-
-    @bp.get("/account")
-    def account():
-        sessions = [{"current": s["token_hash"] == g.session["token_hash"],
-                     "created": datetime.fromtimestamp(s["created_at"]),
-                     "last_seen": datetime.fromtimestamp(s["last_seen"]),
-                     "agent": (s["user_agent"] or "unknown browser")[:80]}
-                    for s in store.sessions_for(g.session["user_id"])]
-        audit = [{"at": datetime.fromtimestamp(a["at"]), "username": a["username"] or "",
-                  "action": a["action"].replace("_", " "), "detail": a["detail"] or ""}
-                 for a in store.recent_audit(25)]
-        return render_template("account.html", title="Account", page="auth.account", sessions=sessions,
-                               audit=audit, error=None, message=MESSAGES.get(request.args.get("msg", "")))
-
-    @bp.post("/account/password")
-    def change_password():
-        new, confirm = request.form.get("new_password", ""), request.form.get("confirm_password", "")
-        try:
-            if new != confirm:
-                raise AuthError("The two new passwords do not match.")
-            store.change_password(g.session, request.form.get("current_password", ""), new)
-        except AuthError as exc:
-            return render_template("account.html", title="Account", page="auth.account", sessions=[], audit=[],
-                                   error=str(exc), message=None), 400
-        return redirect(url_for("auth.account", msg="password_changed"))
-
-    @bp.post("/account/logout-others")
-    def logout_others():
-        store.logout_others(g.session)
-        return redirect(url_for("auth.account", msg="others_logged_out"))
-
-    app.register_blueprint(bp)
-    return store
-EOF
-```
-
-**4. New templates, `login.html` and `account.html`:**
-
-```bash
-cat > ~/surveillance/web/templates/login.html <<'EOF'
-{% extends "base.html" %}
-{% block content %}
-<section class="panel login-panel">
-  <h2>Log in</h2>
-  {% if message %}<p class="notice">{{ message }}</p>{% endif %}
-  {% if no_users %}
-  <p class="notice">No account exists yet. Create one on the Raspberry Pi (over SSH):<br>
-    <code>cd ~/surveillance &amp;&amp; python3 tools/manage_users.py create admin</code></p>
-  {% endif %}
-  <form method="post" action="{{ url_for('auth.login_post') }}" class="stack">
-    <input type="hidden" name="next" value="{{ next }}">
-    <label>Username
-      <input type="text" name="username" value="{{ username }}" autocomplete="username" autocapitalize="none"
-             spellcheck="false" maxlength="64" required autofocus>
-    </label>
-    <label>Password
-      <input type="password" name="password" autocomplete="current-password" maxlength="256" required>
-    </label>
-    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
-    <button class="button primary" type="submit">Log in</button>
-  </form>
-</section>
-{% endblock %}
-EOF
-
-cat > ~/surveillance/web/templates/account.html <<'EOF'
-{% extends "base.html" %}
-{% block content %}
-{% if message %}<p class="notice">{{ message }}</p>{% endif %}
-
-<section class="panel">
-  <h2>Change password</h2>
-  <form method="post" action="{{ url_for('auth.change_password') }}" class="stack narrow">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label>Current password <input type="password" name="current_password" autocomplete="current-password" maxlength="256" required></label>
-    <label>New password (at least 15 characters) <input type="password" name="new_password" autocomplete="new-password" minlength="15" maxlength="256" required></label>
-    <label>Repeat new password <input type="password" name="confirm_password" autocomplete="new-password" minlength="15" maxlength="256" required></label>
-    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
-    <button class="button primary" type="submit">Change password</button>
-  </form>
-  <p class="muted">A long passphrase from a password manager is best. Changing it logs out every other session.</p>
-</section>
-
-{% if sessions %}
-<section class="panel">
-  <h2>Active sessions</h2>
-  <div class="table-wrap">
-    <table class="list">
-      <thead><tr><th>Browser</th><th>Logged in</th><th>Last active</th><th></th></tr></thead>
-      <tbody>
-      {% for s in sessions %}
-        <tr><td>{{ s.agent }}</td><td>{{ s.created.strftime('%Y-%m-%d %H:%M') }}</td>
-          <td>{{ s.last_seen.strftime('%Y-%m-%d %H:%M') }}</td>
-          <td>{% if s.current %}<span class="badge motion">this browser</span>{% endif %}</td></tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  <form method="post" action="{{ url_for('auth.logout_others') }}" class="player-actions">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <button class="button" type="submit">Log out all other sessions</button>
-  </form>
-</section>
-{% endif %}
-
-{% if audit %}
-<section class="panel">
-  <h2>Security log (latest 25)</h2>
-  <div class="table-wrap">
-    <table class="list">
-      <thead><tr><th>Time</th><th>User</th><th>Event</th><th>Detail</th></tr></thead>
-      <tbody>
-      {% for a in audit %}
-        <tr><td>{{ a.at.strftime('%Y-%m-%d %H:%M:%S') }}</td><td>{{ a.username }}</td>
-          <td>{{ a.action }}</td><td>{{ a.detail }}</td></tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</section>
-{% endif %}
-{% endblock %}
-EOF
-```
-
-**5. New tool `tools/manage_users.py`:**
-
-```bash
-cat > ~/surveillance/tools/manage_users.py <<'EOF'
-#!/usr/bin/env python3
-"""Manage web accounts (run on the Pi over SSH; there is deliberately no web sign-up page).
-
-    python3 ~/surveillance/tools/manage_users.py create admin     # asks for the password twice
-    python3 ~/surveillance/tools/manage_users.py passwd admin     # set a new password, ends all sessions
-    python3 ~/surveillance/tools/manage_users.py list
-    python3 ~/surveillance/tools/manage_users.py unlock [admin]   # clear failed-login lockouts
-    python3 ~/surveillance/tools/manage_users.py logout admin     # end every session of the user
-    python3 ~/surveillance/tools/manage_users.py log              # recent security events
-"""
-from __future__ import annotations
-
-import argparse
-import getpass
 import sys
-from datetime import datetime
+import threading
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from flask import Blueprint, g, render_template, request
 
-from app.auth import AUTH_DB_NAME, AuthError, AuthStore  # noqa: E402
-from app.config import DEFAULT_CONFIG_PATH, ConfigError, load_settings  # noqa: E402
+from app.auth import AuthError, AuthStore
+from app.config import (ALLOWED_SEGMENT_SECONDS, LIVE_QUALITIES, LOG_LEVELS, PROJECT_ROOT, RETENTION_MODES,
+                        ConfigError, Settings, diff_settings, load_settings, save_settings, settings_from_dict)
+from app.status import read_status
 
+log = logging.getLogger("Settings")
 
-def ask_password(username: str) -> str:
-    print("Choose a password of at least 15 characters. A passphrase of 4-5 random words works well;")
-    print("a password manager can generate and remember one for you.")
-    first = getpass.getpass(f"New password for {username}: ")
-    second = getpass.getpass("Repeat it: ")
-    if first != second:
-        raise AuthError("The two passwords do not match.")
-    return first
-
-
-def when(epoch: int) -> str:
-    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M") if epoch else "-"
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Manage surveillance web accounts")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("create", "passwd", "logout"):
-        sub.add_parser(name).add_argument("username")
-    sub.add_parser("unlock").add_argument("username", nargs="?")
-    sub.add_parser("list")
-    sub.add_parser("log")
-    args = parser.parse_args()
-
-    try:
-        settings, _ = load_settings(args.config, create_if_missing=False)
-    except ConfigError as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
-        return 2
-    auth = settings.auth
-    store = AuthStore(settings.database_dir / AUTH_DB_NAME, auth.idle_timeout_minutes,
-                      auth.session_max_hours, auth.lockout_threshold)
-    store.init()
-
-    try:
-        if args.command == "create":
-            store.create_user(args.username, ask_password(args.username.lower()))
-            print(f"User {args.username.lower()} created. Log in at http://localhost:8080/login")
-        elif args.command == "passwd":
-            store.set_password(args.username, ask_password(args.username.lower()))
-            print("Password changed; every session of this user was logged out.")
-        elif args.command == "logout":
-            print(f"{store.logout_all(args.username)} session(s) ended.")
-        elif args.command == "unlock":
-            store.unlock(args.username)
-            print("Lockouts cleared.")
-        elif args.command == "list":
-            users = store.list_users()
-            if not users:
-                print("No users yet. Create one with: python3 tools/manage_users.py create admin")
-            for u in users:
-                locked = " LOCKED until " + when(u["locked_until"]) if u["locked_until"] > datetime.now().timestamp() else ""
-                print(f"{u['username']:<20} created {when(u['created_at'])}  password changed "
-                      f"{when(u['password_changed_at'])}  sessions {u['sessions']}  failed logins "
-                      f"{u['failed_logins']}{locked}")
-        elif args.command == "log":
-            for a in reversed(store.recent_audit(50)):
-                print(f"{when(a['at'])}  {a['username'] or '-':<20} {a['action']:<24} {a['detail'] or ''}")
-    except AuthError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-    return 0
+REAUTH_MAX_AGE_S = 300
+RESTART_DELAY_S = 1.5
+TUNING_DIRS = (Path("/usr/share/libcamera/ipa/rpi/vc4"), Path("/usr/local/share/libcamera/ipa/rpi/vc4"))
+RESOLUTIONS = {
+    "1296x972": (1296, 972, 640, 480, "1296 × 972 – full field of view (recommended for OV5647)"),
+    "1920x1080": (1920, 1080, 640, 360, "1920 × 1080 – Full HD (a centre crop on OV5647)"),
+    "1280x720": (1280, 720, 640, 360, "1280 × 720 – HD"),
+    "640x480": (640, 480, 320, 240, "640 × 480 – smallest files"),
+}
+SEGMENT_LABELS = {60: "1 minute", 120: "2 minutes", 300: "5 minutes", 600: "10 minutes",
+                  900: "15 minutes", 1800: "30 minutes", 3600: "1 hour"}
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+@dataclass(frozen=True)
+class Field:
+    key: str            # "section.name"
+    label: str
+    kind: str           # text | int | float | bool | select | mbps | resolution | tuning
+    help: str = ""
+    min: float | None = None
+    max: float | None = None
+    step: float | None = None
+    choices: tuple = ()
+
+    @property
+    def section(self) -> str:
+        return self.key.split(".")[0]
+
+    @property
+    def name(self) -> str:
+        return self.key.split(".")[1]
+
+
+GROUPS: list[tuple[str, list[Field]]] = [
+    ("Camera", [
+        Field("camera.name", "Camera name", "text", "Shown in the page header and in download file names."),
+        Field("camera.resolution", "Recording resolution", "resolution"),
+        Field("camera.framerate", "Frame rate (frames per second)", "float", "15 is plenty for surveillance.", 1, 30, 1),
+        Field("camera.bitrate", "Bitrate (Mbit/s)", "mbps", "Higher is sharper but uses more storage. "
+              "1 Mbit/s ≈ 0.45 GB per hour.", 0.25, 10, 0.25),
+        Field("camera.keyframe_seconds", "Keyframe interval (seconds)", "float",
+              "How often a full picture is stored. Smaller seeks faster, larger files slightly smaller.", 0.5, 10, 0.5),
+        Field("camera.rotate180", "Rotate the image 180°", "bool"),
+        Field("camera.tuning_file", "Colour tuning", "tuning",
+              "Cameras without an infrared filter (NoIR) look pink in daylight; the _noir tuning corrects that."),
+    ]),
+    ("Recording", [
+        Field("recording.segment_seconds", "Segment length", "select", "Recordings are split into files of this length.",
+              choices=tuple((s, SEGMENT_LABELS[s]) for s in ALLOWED_SEGMENT_SECONDS)),
+    ]),
+    ("Motion detection", [
+        Field("motion.enabled", "Motion detection on", "bool"),
+        Field("motion.sensitivity", "Sensitivity (1-100)", "int", "Higher reacts to smaller changes in brightness.", 1, 100, 1),
+        Field("motion.min_area_percent", "Minimum moving area (% of the picture)", "float",
+              "Smaller movements are ignored. 0.5 % is roughly a 20 × 20 pixel patch.", 0.05, 50, 0.05),
+        Field("motion.cooldown_seconds", "Cooldown (seconds)", "float",
+              "An event ends only after this long without movement.", 1, 300, 1),
+        Field("motion.trigger_frames", "Frames needed to start an event", "int",
+              "Movement must be seen in this many analysed frames in a row.", 1, 20, 1),
+        Field("motion.analysis_fps", "Analysed frames per second", "float", "", 1, 15, 1),
+        Field("motion.keep_events_days", "Keep events without footage (days, 0 = forever)", "int", "", 0, 3650, 1),
+    ]),
+    ("Storage", [
+        Field("storage.max_storage_gb", "Maximum recording storage (GB)", "float",
+              "The oldest recordings are deleted to stay below this. Lowering it deletes footage immediately.",
+              0.01, 100000, 0.5),
+        Field("storage.min_free_gb", "Emergency minimum free space (GB)", "float",
+              "Below half of this, recording pauses rather than filling the disk.", 0.1, 10000, 0.5),
+        Field("storage.max_age_days", "Delete recordings older than (days, 0 = off)", "int", "", 0, 3650, 1),
+        Field("storage.retention", "Retention", "select", "", choices=tuple((m, m.replace("_", " ")) for m in RETENTION_MODES)),
+    ]),
+    ("Live view", [
+        Field("live.enabled", "Live view on", "bool"),
+        Field("live.max_fps", "Maximum frames per second", "float", "", 1, 30, 1),
+        Field("live.quality", "Picture quality", "select", "", choices=tuple((q, q) for q in LIVE_QUALITIES)),
+        Field("live.max_viewers", "Maximum simultaneous viewers", "int", "", 1, 6, 1),
+        Field("live.max_view_minutes", "Pause live view after (minutes)", "int", "", 1, 240, 1),
+    ]),
+    ("Security", [
+        Field("auth.idle_timeout_minutes", "Log out after inactivity (minutes)", "int", "", 5, 1440, 1),
+        Field("auth.session_max_hours", "Log out after at most (hours)", "int", "", 1, 168, 1),
+        Field("auth.lockout_threshold", "Wrong passwords before a lockout", "int", "", 3, 20, 1),
+    ]),
+    ("Interface and logging", [
+        Field("web.status_refresh_seconds", "Dashboard refresh (seconds)", "float", "", 2, 60, 1),
+        Field("logging.level", "Log level", "select", "", choices=tuple((lv, lv) for lv in LOG_LEVELS)),
+    ]),
+]
+
+
+def tuning_choices(model: str | None, current: str) -> list[tuple[str, str]]:
+    names = set()
+    for directory in TUNING_DIRS:
+        if directory.is_dir():
+            names.update(p.name for p in directory.glob("*.json") if model and p.stem.startswith(model))
+    if current:
+        names.add(current)
+    return [("", "Default for this camera")] + [(n, n) for n in sorted(names)]
+
+
+def resolution_choices(settings: Settings) -> list[tuple[str, str]]:
+    current = f"{settings.camera.width}x{settings.camera.height}"
+    choices = [(key, spec[4]) for key, spec in RESOLUTIONS.items()]
+    if current not in RESOLUTIONS:
+        choices.insert(0, ("custom", f"{current} (current, set in the settings file)"))
+    return choices
+
+
+def field_value(field: Field, data: dict):
+    if field.kind == "resolution":
+        return f"{data['camera']['width']}x{data['camera']['height']}"
+    value = data[field.section][field.name]
+    return round(value / 1e6, 2) if field.kind == "mbps" else value
+
+
+def apply_form(data: dict, form, tuning: list[tuple[str, str]]) -> list[str]:
+    """Write submitted values into `data` (a settings dict). Returns human-readable parse errors."""
+    errors = []
+    for _group, fields in GROUPS:
+        for field in fields:
+            raw = form.get(field.key)
+            try:
+                if field.kind == "bool":
+                    value = field.key in form
+                elif field.kind == "text":
+                    value = (raw or "").strip()
+                elif field.kind == "int":
+                    value = int(raw)
+                elif field.kind == "float":
+                    value = float(raw)
+                elif field.kind == "mbps":
+                    value = int(round(float(raw) * 1_000_000))
+                elif field.kind == "select":
+                    allowed = {str(key): key for key, _label in field.choices}
+                    value = allowed[raw]
+                elif field.kind == "tuning":
+                    if raw not in {key for key, _label in tuning}:
+                        raise ValueError
+                    value = raw
+                elif field.kind == "resolution":
+                    if raw != "custom":
+                        width, height, lores_w, lores_h, _label = RESOLUTIONS[raw]
+                        data["camera"].update(width=width, height=height, lores_width=lores_w, lores_height=lores_h)
+                    continue
+                else:
+                    continue
+            except (KeyError, TypeError, ValueError):
+                errors.append(f"{field.label}: not a valid value.")
+                continue
+            data[field.section][field.name] = value
+    return errors
+
+
+def restart_web_process() -> None:
+    """Replace this process with a fresh copy that reads the new settings (same PID, same arguments)."""
+    log.info("Restarting the web interface to apply the new settings")
+    logging.shutdown()
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(PROJECT_ROOT), env.get("PYTHONPATH")) if p)
+    os.execve(sys.executable, [sys.executable, "-m", "app.web_main", *sys.argv[1:]], env)
+
+
+def create_blueprint(settings: Settings, config_path: Path, store: AuthStore) -> Blueprint:
+    bp = Blueprint("cfg", __name__)
+    restart_lock = threading.Lock()
+
+    def current_settings() -> tuple[Settings, str | None]:
+        try:
+            return load_settings(config_path, create_if_missing=False)[0], None
+        except ConfigError as exc:
+            return settings, f"The settings file is currently invalid ({exc}); showing the values in use."
+
+    def render(data: dict, current: Settings, *, errors=(), message=None, changes=(), reloading=False, status=200):
+        recorder = read_status(settings.runtime_dir) or {}
+        model = (recorder.get("camera") or {}).get("model")
+        tuning = tuning_choices(model, data["camera"]["tuning_file"])
+        return render_template(
+            "settings.html", title="Settings", page="cfg.settings_page", groups=GROUPS, data=data,
+            value=lambda f: field_value(f, data), tuning=tuning, resolutions=resolution_choices(current),
+            errors=list(errors), message=message, changes=list(changes), reloading=reloading,
+            reauth_needed=not store.reauth_fresh(g.session, REAUTH_MAX_AGE_S),
+            fixed={"Recordings folder": current.paths.recordings_dir, "Database folder": current.paths.database_dir,
+                   "Web address": f"{current.web.host}:{current.web.port}",
+                   "Required mount": current.storage.required_mount or "none"}), status
+
+    @bp.get("/settings")
+    def settings_page():
+        current, problem = current_settings()
+        return render(asdict(current), current, errors=[problem] if problem else [])
+
+    @bp.post("/settings")
+    def save():
+        current, problem = current_settings()
+        if problem:
+            return render(asdict(current), current, errors=[problem], status=409)
+        data = asdict(current)
+        model = ((read_status(settings.runtime_dir) or {}).get("camera") or {}).get("model")
+        errors = apply_form(data, request.form, tuning_choices(model, current.camera.tuning_file))
+        if errors:
+            return render(data, current, errors=errors, status=400)
+        try:
+            new = settings_from_dict(data)
+        except ConfigError as exc:
+            return render(data, current, errors=[str(exc)], status=400)
+        changes = diff_settings(current, new)
+        if not changes:
+            return render(data, current, message="Nothing changed.")
+        if not store.reauth_fresh(g.session, REAUTH_MAX_AGE_S):
+            try:
+                store.reauth(g.session, request.form.get("current_password", ""))
+            except AuthError as exc:
+                return render(data, current, errors=[str(exc)], status=403)
+
+        save_settings(new, config_path)
+        summary = "; ".join(f"{key}: {old} -> {value}" for key, old, value in changes)
+        store.record(g.session["username"], "settings_changed", summary)
+        log.info("Settings changed by %s: %s", g.session["username"], summary)
+        if restart_lock.acquire(blocking=False):
+            threading.Timer(RESTART_DELAY_S, restart_web_process).start()
+        return render(asdict(new), new, message="Settings saved.", changes=changes, reloading=True)
+
+    return bp
+EOF
+```
+
+**3. Replace `web/templates/settings.html`, and add `web/static/settings.js`:**
+
+```bash
+cat > ~/surveillance/web/templates/settings.html <<'EOF'
+{% extends "base.html" %}
+{% block scripts %}<script src="{{ url_for('static', filename='settings.js') }}" defer></script>{% endblock %}
+{% block content %}
+{% if message %}
+<div class="notice" {% if reloading %}id="reload-after" data-seconds="6"{% endif %}>
+  <strong>{{ message }}</strong>
+  {% if changes %}<ul>{% for key, old, new in changes %}<li><code>{{ key }}</code>: {{ old }} &rarr; {{ new }}</li>{% endfor %}</ul>{% endif %}
+  {% if reloading %}<p>The web interface restarts now. The recorder applies recording changes within about
+    10 seconds; a few seconds of video are skipped while the camera restarts. This page reloads by itself.</p>{% endif %}
+</div>
+{% endif %}
+{% if errors %}
+<div class="notice error-box" role="alert"><strong>Not saved:</strong>
+  <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+
+<form method="post" action="{{ url_for('cfg.save') }}" class="settings-form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="settings-grid">
+  {% for group, fields in groups %}
+    <section class="panel">
+      <h2>{{ group }}</h2>
+      {% for f in fields %}
+      <div class="field">
+        {% if f.kind == 'bool' %}
+          <label class="check"><input type="checkbox" name="{{ f.key }}" {% if value(f) %}checked{% endif %}> {{ f.label }}</label>
+        {% else %}
+          <label for="{{ f.key }}">{{ f.label }}</label>
+          {% if f.kind in ('select', 'tuning', 'resolution') %}
+            {% set options = f.choices if f.kind == 'select' else (tuning if f.kind == 'tuning' else resolutions) %}
+            <select id="{{ f.key }}" name="{{ f.key }}">
+              {% for key, label in options %}
+                <option value="{{ key }}" {% if key|string == value(f)|string %}selected{% endif %}>{{ label }}</option>
+              {% endfor %}
+            </select>
+          {% elif f.kind == 'text' %}
+            <input id="{{ f.key }}" type="text" name="{{ f.key }}" value="{{ value(f) }}" maxlength="40" required>
+          {% else %}
+            <input id="{{ f.key }}" type="number" name="{{ f.key }}" value="{{ value(f) }}"
+                   {% if f.min is not none %}min="{{ f.min }}"{% endif %} {% if f.max is not none %}max="{{ f.max }}"{% endif %}
+                   step="{{ '1' if f.kind == 'int' else 'any' }}" required>
+          {% endif %}
+        {% endif %}
+        {% if f.help %}<p class="help">{{ f.help }}</p>{% endif %}
+      </div>
+      {% endfor %}
+    </section>
+  {% endfor %}
+    <section class="panel">
+      <h2>Not editable here</h2>
+      <p class="help">These are changed only on the Pi with <code>tools/set_setting.py</code>, because a mistake
+        could lock you out or send recordings to the wrong disk.</p>
+      <table class="kv">
+        {% for k, v in fixed.items() %}<tr><th scope="row">{{ k }}</th><td>{{ v }}</td></tr>{% endfor %}
+      </table>
+    </section>
+  </div>
+
+  <section class="panel save-bar">
+    {% if reauth_needed %}
+      <label class="field">Your password (required to save settings)
+        <input type="password" name="current_password" autocomplete="current-password" maxlength="256" required>
+      </label>
+    {% else %}
+      <p class="help">You confirmed your password in the last few minutes, so you can save without entering it again.</p>
+    {% endif %}
+    <button class="button primary" type="submit">Save settings</button>
+  </section>
+</form>
+{% endblock %}
+EOF
+
+cat > ~/surveillance/web/static/settings.js <<'EOF'
+"use strict";
+
+// After saving, the web interface restarts; reload once it is back.
+(() => {
+  const notice = document.getElementById("reload-after");
+  if (!notice) return;
+  setTimeout(() => { window.location.href = "/settings"; }, Number(notice.dataset.seconds || 6) * 1000);
+})();
 EOF
 ```
 
 ## Test procedure
 
-**1. Create your account on the Pi.** The password won't be shown as you type:
+**1. Start both programs again:** `python3 -m app.main` in window 1 and `python3 -m app.web_main` in window 2. Log in and open **Settings**.
+
+**2. Check which tuning files are offered:**
 
 ```bash
-cd ~/surveillance
-python3 tools/manage_users.py create admin
-python3 tools/manage_users.py list
-ls -l database/auth.db          # must show -rw------- (only you can read it)
+ls /usr/share/libcamera/ipa/rpi/vc4/ | grep ov5647
 ```
 
-**2. Restart the web interface** (Ctrl+C in window 2, then `python3 -m app.web_main`). The recorder can keep running. Use **Chrome, Edge or Firefox** on the laptop, through the tunnel as before.
+The **Colour tuning** drop-down should list the same files.
 
-**3. In the browser:**
-- Open **http://localhost:8080**. You should land on the **Log in** page, with no navigation bar.
-- Log in with a **wrong** password. Expect "Wrong username or password."
-- Log in correctly. Every page works as before. **Live View** and playing a recording should work too, since they're protected by the same session.
-- Your username and **Log out** appear on the right of the navigation bar.
-
-**4. Account page** (click your username):
-- **Change password.** First enter a wrong current password (it should be refused), then do it properly.
-- **Sessions:** log in from a second browser or a private window, check it appears under **Active sessions**, then use **Log out all other sessions**. The other browser should land on the login page at its next click, or within about 5 s on the dashboard.
-
-**5. Lockout.**
-1. Log out, then enter a wrong password **6 times**. From the 6th attempt you'll see "Too many failed attempts".
-2. Check that it's locked, then unlock it:
-   ```bash
-   python3 tools/manage_users.py list      # shows LOCKED until …
-   python3 tools/manage_users.py unlock admin
+**3. Try the NoIR tuning** in daylight, if possible:
+1. Choose **ov5647_noir.json** and click **Save settings**. It asks for your password if you logged in more than 5 minutes ago.
+2. Within about 10 s, window 1 should show:
+   ```text
+   INFO Main: Settings changed (camera.tuning_file); restarting the recording pipeline
+   INFO Camera: Opened ov5647: … tuning ov5647_noir.json
    ```
-3. Log in normally.
+3. Compare the colours in **Live View**. If they're better, keep it; if not, set it back to **Default for this camera**.
 
-**6. Security checks, on the Pi, while logged out:**
+**4. Checks:**
+- **Invalid combination:** set Frame rate to **10** and Analysed frames per second to **15**, then save. It should refuse with "motion.analysis_fps cannot be higher than camera.framerate".
+- **Web-only change:** change **Dashboard refresh** to 10 and save. Window 1 should log `… recording is not affected`, with no restart.
+- **Security log:** run `python3 tools/manage_users.py log | tail -5`. It should show your `settings_changed` entries with old → new values.
+
+**5. The command line applies automatically too.** Try:
 
 ```bash
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/api/status            # 401
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/live/stream           # 401
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/recordings/1/video    # 401
-curl -s -o /dev/null -w "%{http_code}\n" -X POST -H "Origin: https://evil.example" http://127.0.0.1:8080/login   # 403
-python3 tools/manage_users.py log | tail -10
+python3 tools/set_setting.py motion.sensitivity 65
 ```
+
+The recorder should log `Settings changed (motion.sensitivity); restarting …` within about 5 s, with no manual restart.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| Logging in just shows the login page again, with no error | The browser refused the secure cookie; this is the case in Safari. Use Chrome, Edge or Firefox through the tunnel. |
-| "This request was refused" | You submitted a form from a page opened before restarting the web interface, or from another site. Reload the page and try again. |
-| You locked yourself out | Run `python3 tools/manage_users.py unlock` on the Pi. |
-| You forgot your password | Run `python3 tools/manage_users.py passwd admin` on the Pi. |
-| `ModuleNotFoundError: argon2` | `sudo apt install -y python3-argon2` |
+| The page doesn't come back after a save | Check window 2. The web interface restarts itself in place; if it stopped instead, start it again and send me the last lines of `logs/web.log`. |
+| `cannot load tuning file …` in the recorder log | Pick another tuning file, or "Default", in Settings. The recorder keeps retrying and logs the error meanwhile. |
+| "The settings file is currently invalid" | A hand edit broke the file. The message says which value; fix it with `tools/set_setting.py`. |
 
 **Please send me:**
-- whether login, logout, the password change and the lockout behaved as described;
-- the output of step 6;
-- a screenshot of the Account page, if you like.
+- whether saving worked and the recorder picked up the change;
+- whether `ov5647_noir.json` improved the colours (a Live View screenshot with each setting helps);
+- the security log lines.
 
-Next is **Phase 11b**, the editable Settings page:
-- every setting validated;
-- dangerous changes (for example the storage limit or the recordings folder) require re-entering your password;
-- the recorder picks up changes automatically;
-- the optional `camera.tuning_file` for your NoIR camera's colours.
-
-After that, Phase 12 sets up Tailscale for private remote access.
+Next is **Phase 12: Tailscale**. It gives you private, encrypted access from your phone and laptop with no router changes, a real HTTPS address with a valid certificate, and SSH only over the private network.
