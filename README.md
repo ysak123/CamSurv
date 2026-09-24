@@ -1,92 +1,67 @@
-Phase 13b is ready as version 0.13.2. The Settings page now has a Time zone section and Restart / Shut down buttons at the bottom.
+Phase 13b is confirmed on the real Pi. Phase 14 (hardening) is ready as version 0.14.0, in four parts that you run one at a time:
 
-**How it's protected:**
+| Part | What it does | Lock-out protection |
+|---|---|---|
+| **SSH** (`harden.sh ssh`) | Keys only (no passwords), no root login, only your account, only `-L` forwarding (so the SSH tunnel keeps working) | Refuses until your key is installed **and** the log shows you've logged in with it at least once |
+| **Firewall** (`harden.sh firewall`) | Nothing on the home network or internet can open a connection to the Pi. Only tailnet devices reach SSH (22) and the web page (443). Ping, DHCP, Tailscale's own traffic, and connections the Pi opens itself (updates, time) keep working | Refuses if Tailscale is down, and removes itself after 3 minutes unless you confirm from a **new** SSH session over the tailnet. It uses its own rules table, so Tailscale's rules are left alone |
+| **Updates** (`harden.sh updates`) | Daily automatic Debian stable and security updates | Camera packages from the Raspberry Pi archive (kernel, firmware, libcamera, picamera2) stay manual, so an update can't change the camera without you knowing |
+| **Audit** (`phase14_security_audit.py`) | Read-only check of what's really in effect: sshd's effective settings, keys, the firewall, listening ports, sudo rules, updates, service sandboxes, file permissions and accounts | Changes nothing |
 
-- **Fixed actions only:** the browser can choose one of three fixed actions and nothing else. The time zone must be one of the system's own zone names, and no command is ever built from browser input.
-- **Password every time:** Restart and Shut down always ask for your password, and the browser shows a confirmation dialog first. The time zone uses the same 5-minute password window as other settings.
-- **Normal protections still apply:** CSRF token and same-origin checks, lockout counting, and an entry in the audit log.
-- **Narrow permission rule:** a polkit rule, the operating system's permission system, allows exactly these three actions. It allows them only for processes of user `cctv` inside `surveillance-web.service`. The recorder runs as the same user and is still refused.
-- **Recorder log times:** after a time-zone change, the recorder's log timestamps switch to the new zone without a restart.
+I tested all four on the Debian 13 test system, and the firewall rules in an isolated network namespace as well:
 
-I tested it on a real Debian 13 system running systemd in a container:
+- **SSH:** `harden.sh ssh` refused with no key, and refused again with a key that had never been used. After a key login it applied the settings, and they won even over a Pi-style `50-cloud-init.conf` that says `PasswordAuthentication yes`.
+  - Key login is accepted.
+  - Password login and root login (even with a valid key) are refused.
+  - `-L` to the web page still works; `-R` and agent forwarding are refused.
+- **Firewall:** from the home network, SSH, 443 and 8080 are blocked over both IPv4 and IPv6. From `tailscale0`, 22 and 443 are open and 8080 isn't. Ping, Tailscale's traffic and the Pi's own outgoing connections work.
+  - Unconfirmed, it removed itself after the delay. Confirmed, it survived a reboot and loaded before the network.
+- **Updates and audit:** automatic updates were installed and switched on. The audit ended with 37 pass, 0 fail, and only the two warnings I expected from the test system.
 
-- **Refused callers:** any other unit running as `cctv` is refused ("Interactive authentication required", and the reboot check answers "challenge").
-- **Rejected requests:** a wrong password, a request without the CSRF token, and an unknown action were all rejected.
-- **Working actions:** from the website, a time-zone change, Restart and Shut down all worked, and the audit log recorded each one with your account name.
-- **Clean stops:** on both restart and shutdown, the recorder finished its segment cleanly first.
-
-## Step 1 — Apply the update
+## Step 1 — Apply the update and deploy it
 
 ```bash
 cd ~/surveillance
-cat > update_to_0_13_2.py <<'PYEOF'
+cat > update_to_0_14_0.py <<'PYEOF'
 #!/usr/bin/env python3
-"""Update the surveillance project from 0.13.1 to 0.13.2 (run from ~/surveillance)."""
+"""Update the surveillance project from 0.13.2 to 0.14.0 (run from ~/surveillance)."""
 import os, shutil, sys
 from pathlib import Path
 
 EDITS = [
     ('app/__init__.py',
-     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.13.1"\n',
-     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.13.2"\n'),
-    ('app/main.py',
-     '    def _run(self) -> None:\n        while not self._halt.wait(SETTINGS_CHECK_S):\n            signature = self._file_signature()\n            if signature is None or signature == self._signature:\n',
-     '    def _run(self) -> None:\n        while not self._halt.wait(SETTINGS_CHECK_S):\n            time.tzset()  # picks up a time zone change (Settings page) for the log timestamps\n            signature = self._file_signature()\n            if signature is None or signature == self._signature:\n'),
-    ('app/web_settings.py',
-     '  and this web process restarts itself so it uses the new values too.\n* Paths, network address and log file details are deliberately not editable from the browser.\n"""\nfrom __future__ import annotations\n',
-     '  and this web process restarts itself so it uses the new values too.\n* Paths, network address and log file details are deliberately not editable from the browser.\n* Phase 13b: the time zone, and Restart / Shut down (password needed every time), through the\n  fixed actions in app/system_control.py.\n"""\nfrom __future__ import annotations\n'),
-    ('app/web_settings.py',
-     'from pathlib import Path\n\nfrom flask import Blueprint, g, render_template, request\n\nfrom app.auth import AuthError, AuthStore\n',
-     'from pathlib import Path\n\nfrom flask import Blueprint, abort, g, render_template, request\n\nfrom app.auth import AuthError, AuthStore\n'),
-    ('app/web_settings.py',
-     '                        ConfigError, Settings, diff_settings, load_settings, save_settings, settings_from_dict)\nfrom app.status import read_status\n\nlog = logging.getLogger("Settings")\n',
-     '                        ConfigError, Settings, diff_settings, load_settings, save_settings, settings_from_dict)\nfrom app.status import read_status\nfrom app.system_control import (POWER_ACTIONS, SystemControlError, check_power, current_time_zone, schedule_power,\n                                set_time_zone, time_zones)\n\nlog = logging.getLogger("Settings")\n'),
-    ('app/web_settings.py',
-     'REAUTH_MAX_AGE_S = 300\nRESTART_DELAY_S = 1.5\nRESOLUTIONS = {\n    "1296x972": (1296, 972, 640, 480, "1296 × 972 – full field of view (recommended for OV5647)"),\n',
-     'REAUTH_MAX_AGE_S = 300\nRESTART_DELAY_S = 1.5\nPOWER_DELAY_S = 3.0\nRESOLUTIONS = {\n    "1296x972": (1296, 972, 640, 480, "1296 × 972 – full field of view (recommended for OV5647)"),\n'),
-    ('app/web_settings.py',
-     '    bp = Blueprint("cfg", __name__)\n    restart_lock = threading.Lock()\n\n    def current_settings() -> tuple[Settings, str | None]:\n',
-     '    bp = Blueprint("cfg", __name__)\n    restart_lock = threading.Lock()\n    zones = time_zones()\n\n    def restart_soon() -> None:\n        if restart_lock.acquire(blocking=False):\n            threading.Timer(RESTART_DELAY_S, restart_web_process).start()\n\n    def current_settings() -> tuple[Settings, str | None]:\n'),
-    ('app/web_settings.py',
-     '            errors=list(errors), message=message, changes=list(changes), reloading=reloading,\n            reauth_needed=not store.reauth_fresh(g.session, REAUTH_MAX_AGE_S),\n            fixed={"Recordings folder": current.paths.recordings_dir, "Database folder": current.paths.database_dir,\n                   "Web address": f"{current.web.host}:{current.web.port}",\n',
-     '            errors=list(errors), message=message, changes=list(changes), reloading=reloading,\n            reauth_needed=not store.reauth_fresh(g.session, REAUTH_MAX_AGE_S),\n            time_zones=zones, time_zone=current_time_zone(),\n            fixed={"Recordings folder": current.paths.recordings_dir, "Database folder": current.paths.database_dir,\n                   "Web address": f"{current.web.host}:{current.web.port}",\n'),
-    ('app/web_settings.py',
-     '        store.record(g.session["username"], "settings_changed", summary)\n        log.info("Settings changed by %s: %s", g.session["username"], summary)\n        if restart_lock.acquire(blocking=False):\n            threading.Timer(RESTART_DELAY_S, restart_web_process).start()\n        return render(asdict(new), new, message="Settings saved.", changes=changes, reloading=True)\n\n    return bp\n',
-     '        store.record(g.session["username"], "settings_changed", summary)\n        log.info("Settings changed by %s: %s", g.session["username"], summary)\n        restart_soon()\n        return render(asdict(new), new, message="Settings saved.", changes=changes, reloading=True)\n\n    @bp.post("/settings/timezone")\n    def save_time_zone():\n        current, _problem = current_settings()\n        zone = request.form.get("timezone", "")\n        if zone == current_time_zone():\n            return render(asdict(current), current, message="Nothing changed.")\n        try:\n            if not store.reauth_fresh(g.session, REAUTH_MAX_AGE_S):\n                store.reauth(g.session, request.form.get("current_password", ""))\n            set_time_zone(zone, zones)\n        except (AuthError, SystemControlError) as exc:\n            return render(asdict(current), current, errors=[str(exc)], status=403)\n        store.record(g.session["username"], "timezone_changed", zone)\n        log.info("Time zone changed to %s by %s", zone, g.session["username"])\n        restart_soon()\n        return render(asdict(current), current, message=f"Time zone set to {zone}.", reloading=True)\n\n    @bp.post("/system/power")\n    def power():\n        action = request.form.get("action", "")\n        if action not in POWER_ACTIONS:\n            abort(400)\n        current, _problem = current_settings()\n        try:\n            store.reauth(g.session, request.form.get("power_password", ""))\n            check_power(action)\n        except (AuthError, SystemControlError) as exc:\n            return render(asdict(current), current, errors=[str(exc)], status=403)\n        store.record(g.session["username"], action, "requested from the web interface")\n        log.warning("%s requested by %s from the web interface", action, g.session["username"])\n        schedule_power(action, POWER_DELAY_S)\n        return render_template("power.html", title="Restarting" if action == "reboot" else "Shutting down",\n                               page="cfg.settings_page", action=action)\n\n    return bp\n'),
-    ('web/templates/settings.html',
-     '  <strong>{{ message }}</strong>\n  {% if changes %}<ul>{% for key, old, new in changes %}<li><code>{{ key }}</code>: {{ old }} &rarr; {{ new }}</li>{% endfor %}</ul>{% endif %}\n  {% if reloading %}<p>The web interface restarts now. The recorder applies recording changes within about\n    10 seconds; a few seconds of video are skipped while the camera restarts. This page reloads by itself.</p>{% endif %}\n</div>\n{% endif %}\n',
-     '  <strong>{{ message }}</strong>\n  {% if changes %}<ul>{% for key, old, new in changes %}<li><code>{{ key }}</code>: {{ old }} &rarr; {{ new }}</li>{% endfor %}</ul>{% endif %}\n  {% if reloading %}<p>The web interface restarts now{% if changes %}. The recorder applies recording changes within\n    about 10 seconds; a few seconds of video are skipped while the camera restarts{% endif %}. This page reloads by\n    itself.</p>{% endif %}\n</div>\n{% endif %}\n'),
-    ('web/templates/settings.html',
-     '    <section class="panel">\n      <h2>Not editable here</h2>\n      <p class="help">These are changed only on the Pi with <code>tools/set_setting.py</code>, because a mistake\n        could lock you out or send recordings to the wrong disk.</p>\n      <table class="kv">\n        {% for k, v in fixed.items() %}<tr><th scope="row">{{ k }}</th><td>{{ v }}</td></tr>{% endfor %}\n',
-     '    <section class="panel">\n      <h2>Not editable here</h2>\n      <p class="help">These are changed only on the Pi with <code>sudo cctv-tool set_setting</code>, because a\n        mistake could lock you out or send recordings to the wrong disk.</p>\n      <table class="kv">\n        {% for k, v in fixed.items() %}<tr><th scope="row">{{ k }}</th><td>{{ v }}</td></tr>{% endfor %}\n'),
-    ('web/templates/settings.html',
-     '  </section>\n</form>\n{% endblock %}\n',
-     '  </section>\n</form>\n\n<div class="settings-grid system-grid">\n  <section class="panel">\n    <h2>Time zone</h2>\n    <form method="post" action="{{ url_for(\'cfg.save_time_zone\') }}">\n      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">\n      <div class="field">\n        <label for="timezone">Used for the times shown on these pages and in the logs</label>\n        <select id="timezone" name="timezone">\n          {% if time_zone not in time_zones %}<option value="{{ time_zone or \'\' }}" selected>{{ time_zone or "unknown" }}</option>{% endif %}\n          {% for zone in time_zones %}\n            <option value="{{ zone }}" {% if zone == time_zone %}selected{% endif %}>{{ zone.replace("_", " ") }}</option>\n          {% endfor %}\n        </select>\n        <p class="help">Recordings are always named and stored in UTC, so changing this never mixes them up.</p>\n      </div>\n      {% if reauth_needed %}\n      <div class="field">\n        <label for="tz-password">Your password</label>\n        <input id="tz-password" type="password" name="current_password" autocomplete="current-password" maxlength="256" required>\n      </div>\n      {% endif %}\n      <button class="button primary" type="submit">Set time zone</button>\n    </form>\n  </section>\n  <section class="panel">\n    <h2>Restart or shut down the Pi</h2>\n    <form method="post" action="{{ url_for(\'cfg.power\') }}">\n      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">\n      <div class="field">\n        <label for="power-password">Your password (needed every time)</label>\n        <input id="power-password" type="password" name="power_password" autocomplete="current-password" maxlength="256" required>\n        <p class="help">Recording stops while the Pi restarts (about a minute). After a shutdown the Pi stays off\n          until its power is unplugged and plugged back in.</p>\n      </div>\n      <div class="button-row">\n        <button class="button" type="submit" name="action" value="reboot"\n                data-confirm="Restart the Pi now? Recording stops for about a minute.">Restart Pi</button>\n        <button class="button danger" type="submit" name="action" value="poweroff"\n                data-confirm="Shut the Pi down? It will NOT start again until its power is unplugged and plugged back in.">Shut down Pi</button>\n      </div>\n    </form>\n  </section>\n</div>\n{% endblock %}\n'),
-    ('web/static/settings.js',
-     '  setTimeout(() => { window.location.href = "/settings"; }, Number(notice.dataset.seconds || 6) * 1000);\n})();\n',
-     '  setTimeout(() => { window.location.href = "/settings"; }, Number(notice.dataset.seconds || 6) * 1000);\n})();\n\n// Restart / Shut down ask once more before the form is sent.\ndocument.querySelectorAll("button[data-confirm]").forEach((button) => {\n  button.addEventListener("click", (event) => {\n    if (!window.confirm(button.dataset.confirm)) event.preventDefault();\n  });\n});\n\n// After "Restart Pi": wait, then poll until the camera answers again.\n(() => {\n  const waiting = document.getElementById("wait-for-restart");\n  if (!waiting) return;\n  const poll = () => {\n    fetch("/login", { cache: "no-store" })\n      .then((response) => { if (response.ok) window.location.href = "/"; else setTimeout(poll, 5000); })\n      .catch(() => setTimeout(poll, 5000));\n  };\n  setTimeout(poll, Number(waiting.dataset.after || 30) * 1000);\n})();\n'),
-    ('web/static/style.css',
-     '.save-bar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 1rem; position: sticky; bottom: 0; }\n.save-bar .field { border: 0; flex: 1; min-width: 240px; }\n',
-     '.save-bar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 1rem; position: sticky; bottom: 0; }\n.save-bar .field { border: 0; flex: 1; min-width: 240px; }\n\n/* ---- Phase 13b: time zone, restart and shut down ---- */\n.system-grid { margin-top: 1rem; }\n.system-grid form { display: grid; gap: .6rem; }\n.system-grid form > .button { justify-self: start; }\n.button-row { display: flex; flex-wrap: wrap; gap: .6rem; }\n.button.danger { background: #4a1f24; border-color: var(--bad); }\n.button.danger:hover { border-color: #ff8a8a; }\n'),
-    ('deploy/install.sh',
-     'install -m 0644 "$APP/deploy/journald-surveillance.conf" /etc/systemd/journald.conf.d/50-surveillance.conf\ninstall -m 0755 "$APP/deploy/cctv-tool" /usr/local/sbin/cctv-tool\nsystemctl daemon-reload\nsystemctl try-restart systemd-journald.service || true\n',
-     'install -m 0644 "$APP/deploy/journald-surveillance.conf" /etc/systemd/journald.conf.d/50-surveillance.conf\ninstall -m 0755 "$APP/deploy/cctv-tool" /usr/local/sbin/cctv-tool\nif [ -d /etc/polkit-1/rules.d ]; then\n    install -m 0644 "$APP/deploy/polkit-surveillance.rules" /etc/polkit-1/rules.d/50-surveillance.rules\n    echo "polkit rule installed (Restart / Shut down / time zone from the web page)"\nelse\n    echo "WARNING: polkit is not installed, so Restart / Shut down / time zone will not work from the web page."\n    echo "         Install it with: sudo apt install polkitd   then run this script again."\nfi\nsystemctl daemon-reload\nsystemctl try-restart systemd-journald.service || true\n'),
+     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.13.2"\n',
+     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.14.0"\n'),
+    ('tools/phase12_tailscale_check.py',
+     'HTTPS_TIMEOUT_S = 60\nKNOWN_PORTS = {\n    22: "SSH, restricted to the tailnet in Phase 14",\n    111: "rpcbind (an NFS helper this camera does not need): disable it, Phase 12 step 13",\n}\n',
+     'HTTPS_TIMEOUT_S = 60\nKNOWN_PORTS = {\n    22: "SSH: limit it to the tailnet with the Phase 14 firewall",\n    111: "rpcbind (an NFS helper this camera does not need): disable it, Phase 12 step 13",\n}\n'),
+    ('tools/phase12_tailscale_check.py',
+     '\n    print("Listening ports")\n    sockets = listening_tcp()\n    web = [s for s in sockets if s[1] == web_port]\n',
+     '\n    print("Listening ports")\n    firewall = subprocess.run(["systemctl", "is-active", "--quiet", "surveillance-firewall"],\n                              check=False).returncode == 0\n    sockets = listening_tcp()\n    web = [s for s in sockets if s[1] == web_port]\n'),
+    ('tools/phase12_tailscale_check.py',
+     '        if is_tailnet(addr):\n            print(f"         tailnet only : {addr}:{port}{who}")\n        else:\n            label = KNOWN_PORTS.get(port, "check what this is")\n',
+     '        if is_tailnet(addr):\n            print(f"         tailnet only : {addr}:{port}{who}")\n        elif firewall:\n            report("PASS", f"{addr or \'*\'}:{port}{who}: the firewall blocks it from the home network"\n                           + (" (open inside the tailnet)" if port in (22, 443) else ""))\n        else:\n            label = KNOWN_PORTS.get(port, "check what this is")\n'),
 ]
 
 NEW_FILES = [
-    ('app/system_control.py', 0o644,
-     '"""Restart / shut down the Pi and set its time zone from the web interface (Phase 13b).\n\nThe browser can only choose one of these fixed actions; no command is ever built from what it\nsends. The time zone must be one of the system\'s own zone names, and the commands run without\na shell. The operating system then decides whether the caller may do it: the polkit rule in\ndeploy/polkit-surveillance.rules allows exactly these actions to surveillance-web.service and\nnothing else, so running the same code anywhere else is refused.\n"""\nfrom __future__ import annotations\n\nimport logging\nimport os\nimport re\nimport subprocess\nimport threading\nimport zoneinfo\n\nlog = logging.getLogger("System")\n\n# action -> (logind "Can..." method, systemctl verb)\nPOWER_ACTIONS = {"reboot": ("CanReboot", "reboot"), "poweroff": ("CanPowerOff", "poweroff")}\nZONE_REGIONS = ("Africa", "America", "Antarctica", "Arctic", "Asia", "Atlantic", "Australia", "Europe",\n                "Indian", "Pacific")\nZONE_PATTERN = re.compile(r"^[A-Za-z]+(/[A-Za-z0-9_+-]+){1,2}$")\nCOMMAND_TIMEOUT_S = 20\n\n\nclass SystemControlError(RuntimeError):\n    pass\n\n\ndef _run(args: list[str]) -> subprocess.CompletedProcess:\n    try:\n        return subprocess.run(args, capture_output=True, text=True, timeout=COMMAND_TIMEOUT_S, check=False,\n                              stdin=subprocess.DEVNULL)\n    except (OSError, subprocess.TimeoutExpired) as exc:\n        raise SystemControlError(f"{args[0]} failed: {exc}") from exc\n\n\ndef _message(result: subprocess.CompletedProcess) -> str:\n    text = (result.stderr or result.stdout or "").strip().splitlines()\n    return text[-1][:200] if text else f"exit code {result.returncode}"\n\n\ndef time_zones() -> list[str]:\n    zones = {zone for zone in zoneinfo.available_timezones()\n             if zone.split("/")[0] in ZONE_REGIONS and ZONE_PATTERN.match(zone)}\n    return ["UTC", *sorted(zones)]\n\n\ndef current_time_zone() -> str | None:\n    try:\n        result = _run(["timedatectl", "show", "-p", "Timezone", "--value"])\n        if result.returncode == 0 and result.stdout.strip():\n            return result.stdout.strip()\n    except SystemControlError:\n        pass\n    try:\n        target = os.readlink("/etc/localtime")\n    except OSError:\n        return None\n    return target.split("zoneinfo/", 1)[1] if "zoneinfo/" in target else None\n\n\ndef set_time_zone(zone: str, allowed: list[str]) -> None:\n    if zone not in allowed:\n        raise SystemControlError("Unknown time zone.")\n    result = _run(["timedatectl", "set-timezone", zone])\n    if result.returncode != 0:\n        raise SystemControlError(f"The system refused to change the time zone: {_message(result)}")\n\n\ndef check_power(action: str) -> None:\n    """Ask logind whether this process may do it now, so a refusal is shown on the page."""\n    method = POWER_ACTIONS[action][0]\n    result = _run(["busctl", "call", "org.freedesktop.login1", "/org/freedesktop/login1",\n                   "org.freedesktop.login1.Manager", method])\n    answer = result.stdout.strip().removeprefix("s ").strip(\'"\') if result.returncode == 0 else ""\n    if answer != "yes":\n        detail = answer or _message(result)\n        raise SystemControlError(f"The system does not allow this ({detail}). Is the polkit rule installed? "\n                                 "Run sudo bash ~/surveillance/deploy/install.sh on the Pi.")\n\n\ndef schedule_power(action: str, delay_s: float) -> None:\n    """Run it a moment later, so the confirmation page reaches the browser first."""\n    def run() -> None:\n        try:\n            result = _run(["systemctl", POWER_ACTIONS[action][1]])\n        except SystemControlError as exc:\n            log.error("%s failed: %s", action, exc)\n            return\n        if result.returncode != 0:\n            log.error("%s failed: %s", action, _message(result))\n\n    threading.Timer(delay_s, run).start()\n'),
-    ('deploy/polkit-surveillance.rules', 0o644,
-     '// Installed as /etc/polkit-1/rules.d/50-surveillance.rules by deploy/install.sh (Phase 13b).\n// Lets the camera\'s web interface restart or shut down the Pi and set its time zone, and nothing\n// else. Only processes of user "cctv" inside surveillance-web.service qualify: the recorder runs\n// as the same user and is still refused. The web page asks for the account password each time.\npolkit.addRule(function (action, subject) {\n    var allowed = [\n        "org.freedesktop.login1.reboot",\n        "org.freedesktop.login1.reboot-multiple-sessions",\n        "org.freedesktop.login1.reboot-ignore-inhibit",\n        "org.freedesktop.login1.power-off",\n        "org.freedesktop.login1.power-off-multiple-sessions",\n        "org.freedesktop.login1.power-off-ignore-inhibit",\n        "org.freedesktop.timedate1.set-timezone"\n    ];\n    if (subject.user === "cctv" && subject.system_unit === "surveillance-web.service" &&\n            allowed.indexOf(action.id) >= 0) {\n        return polkit.Result.YES;\n    }\n    return polkit.Result.NOT_HANDLED;\n});\n'),
-    ('web/templates/power.html', 0o644,
-     '{% extends "base.html" %}\n{% block scripts %}<script src="{{ url_for(\'static\', filename=\'settings.js\') }}" defer></script>{% endblock %}\n{% block content %}\n<section class="panel">\n  {% if action == "reboot" %}\n    <h2>Restarting the Pi</h2>\n    <p>The Pi restarts in a few seconds. Recording stops for about a minute, then everything starts by itself.</p>\n    <p id="wait-for-restart" data-after="30" class="help">This page reconnects by itself when the camera is back.</p>\n  {% else %}\n    <h2>Shutting down the Pi</h2>\n    <p>The Pi shuts down in a few seconds and <strong>stays off</strong>. Wait until its green light has stopped\n      flashing, then unplug the power. Plugging it back in starts it again.</p>\n  {% endif %}\n</section>\n{% endblock %}\n'),
+    ('deploy/harden.sh', 0o755,
+     '#!/bin/bash\n# Phase 14: harden the Pi. Run each part on its own, from your project folder:\n#\n#   sudo bash ~/surveillance/deploy/harden.sh ssh               SSH: keys only, no passwords, no root\n#   sudo bash ~/surveillance/deploy/harden.sh firewall          firewall ON, switches itself off after\n#                                                                3 minutes unless confirmed\n#   sudo bash ~/surveillance/deploy/harden.sh firewall-confirm  keep it (from a NEW SSH session over the tailnet)\n#   sudo bash ~/surveillance/deploy/harden.sh firewall-off      remove it again\n#   sudo bash ~/surveillance/deploy/harden.sh updates           automatic security updates\n#\n# Each part refuses to run if it could lock you out (no working SSH key yet, Tailscale down).\nset -euo pipefail\n\nAPP=/opt/surveillance\nSSHD_DROPIN=/etc/ssh/sshd_config.d/10-surveillance.conf\nFIREWALL_UNIT=surveillance-firewall.service\nUNDO_UNIT=surveillance-firewall-undo\nUNDO_AFTER_S=180\n\nsay() { printf \'\\n== %s\\n\' "$*"; }\ndie() { printf \'\\nERROR: %s\\n\' "$*" >&2; exit 1; }\n\n[ "$(id -u)" -eq 0 ] || die "run it with sudo: sudo bash $0 ${1:-}"\n[ -f "$APP/deploy/firewall.nft" ] || die "$APP is missing or old: run sudo bash ~/surveillance/deploy/install.sh first"\nADMIN="${SUDO_USER:-}"\n\nharden_ssh() {\n    [[ "$ADMIN" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] && [ "$ADMIN" != root ] || \\\n        die "run this with sudo from your own account (not as root)"\n    local home keys\n    home="$(getent passwd "$ADMIN" | cut -d: -f6)"\n    keys="$home/.ssh/authorized_keys"\n    say "Checking that $ADMIN can log in with a key"\n    grep -Eqs \'^(ssh-ed25519|ecdsa-sha2-|sk-ssh-ed25519|sk-ecdsa-sha2-|ssh-rsa) \' "$keys" || \\\n        die "no SSH public key in $keys yet. Add your laptop\'s key first (Phase 14, step 1)."\n    echo "keys in $keys: $(grep -Ec \'^(ssh-|ecdsa-|sk-)\' "$keys")"\n    if ! journalctl --since "-7 days" -o cat -t sshd -t sshd-session 2>/dev/null | \\\n            grep -q "Accepted publickey for $ADMIN "; then\n        die "no successful key login for $ADMIN in the last 7 days. Log in once with your key (step 1), then run this again."\n    fi\n    echo "a key login for $ADMIN was seen"\n    local mode\n    mode="$(stat -c %a "$home/.ssh")"\n    [ "$mode" = 700 ] || { chmod 700 "$home/.ssh"; echo "fixed permissions of $home/.ssh (was $mode)"; }\n    chmod 600 "$keys"\n\n    say "Installing $SSHD_DROPIN"\n    sed "s/^AllowUsers ADMIN_USER$/AllowUsers $ADMIN/" "$APP/deploy/sshd-hardening.conf" > "$SSHD_DROPIN.new"\n    chmod 0644 "$SSHD_DROPIN.new"\n    mv "$SSHD_DROPIN.new" "$SSHD_DROPIN"\n    if ! sshd -t; then\n        rm -f "$SSHD_DROPIN"\n        die "sshd rejected the new settings; they were removed again, nothing changed"\n    fi\n    systemctl reload ssh.service 2>/dev/null || systemctl reload sshd.service\n    echo "sshd reloaded (your current session stays open)"\n    say "Settings sshd now uses"\n    sshd -T | grep -E \'^(pubkeyauthentication|authenticationmethods|passwordauthentication|kbdinteractiveauthentication|permitrootlogin|allowusers|allowtcpforwarding|x11forwarding|maxauthtries) \' | sed \'s/^/  /\'\n    cat <<EOF\n\nKeep this session open. In a NEW terminal on your laptop, check:\n  ssh $ADMIN@cam01                                  -> logs in with your key\n  ssh -o PubkeyAuthentication=no $ADMIN@cam01       -> "Permission denied (publickey)"\nIf the first one fails, undo it from this session:  sudo rm $SSHD_DROPIN && sudo systemctl reload ssh\nEOF\n}\n\nfirewall_on() {\n    command -v nft >/dev/null || { say "Installing nftables"; apt-get install -y nftables; }\n    say "Checking that Tailscale is up (the only way in once the firewall is on)"\n    ip link show tailscale0 >/dev/null 2>&1 || die "there is no tailscale0 interface: is Tailscale running?"\n    tailscale status --json 2>/dev/null | grep -q \'"BackendState": "Running"\' || die "Tailscale is not connected"\n    echo "Tailscale is connected"\n    if systemctl is-enabled nftables.service >/dev/null 2>&1; then\n        echo "WARNING: nftables.service is enabled. Its /etc/nftables.conf usually starts with \'flush ruleset\',"\n        echo "         which also removes Tailscale\'s own rules. Disable it: sudo systemctl disable nftables"\n    fi\n    nft -c -f "$APP/deploy/firewall.nft" || die "the firewall rules do not load; nothing changed"\n\n    say "Firewall ON (for $UNDO_AFTER_S seconds unless you confirm)"\n    install -m 0644 "$APP/deploy/$FIREWALL_UNIT" /etc/systemd/system/\n    systemctl daemon-reload\n    systemctl stop "$UNDO_UNIT.timer" 2>/dev/null || true\n    systemctl reset-failed "$UNDO_UNIT.service" "$UNDO_UNIT.timer" 2>/dev/null || true\n    systemctl restart "$FIREWALL_UNIT"\n    systemd-run --quiet --unit="$UNDO_UNIT" --on-active="$UNDO_AFTER_S" --timer-property=AccuracySec=1s \\\n        systemctl stop "$FIREWALL_UNIT"\n    nft list chain inet cctv_filter input | sed \'s/^/  /\'\n    cat <<EOF\n\nIt switches itself off at $(date -d "+$UNDO_AFTER_S seconds" +%H:%M:%S) unless you confirm. Now, in a NEW terminal on your laptop:\n  ssh $ADMIN@cam01                                                   (over the tailnet)\n  sudo bash ~/surveillance/deploy/harden.sh firewall-confirm\nIf that new connection does not work, do nothing: the firewall removes itself.\nEOF\n}\n\nfirewall_confirm() {\n    systemctl is-active --quiet "$FIREWALL_UNIT" || \\\n        die "the firewall is not running (it may have switched itself off already). Run \'firewall\' again."\n    systemctl stop "$UNDO_UNIT.timer" 2>/dev/null || true\n    systemctl enable "$FIREWALL_UNIT"\n    say "Firewall kept, and on at every boot"\n    echo "Emergency off (keyboard and screen on the Pi): sudo systemctl disable --now $FIREWALL_UNIT"\n}\n\nfirewall_off() {\n    systemctl stop "$UNDO_UNIT.timer" 2>/dev/null || true\n    systemctl disable --now "$FIREWALL_UNIT" 2>/dev/null || true\n    nft delete table inet cctv_filter 2>/dev/null || true\n    say "Firewall removed"\n}\n\nauto_updates() {\n    say "Installing unattended-upgrades"\n    DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades\n    install -m 0644 "$APP/deploy/apt-auto-upgrades.conf" /etc/apt/apt.conf.d/20auto-upgrades\n    systemctl enable --now apt-daily.timer apt-daily-upgrade.timer\n    say "Configuration"\n    apt-config dump | grep -E \'^APT::Periodic::(Update-Package-Lists|Unattended-Upgrade) \' | sed \'s/^/  /\'\n    apt-config dump | grep -E \'^Unattended-Upgrade::Origins-Pattern::\' | sed \'s/^/  /\'\n    systemctl list-timers apt-daily.timer apt-daily-upgrade.timer --no-pager | sed \'s/^/  /\'\n    say "Trial run (installs nothing)"\n    unattended-upgrade --dry-run -v 2>&1 | tail -n 5 | sed \'s/^/  /\' || true\n    echo "Log of real runs: /var/log/unattended-upgrades/unattended-upgrades.log"\n}\n\ncase "${1:-}" in\n    ssh) harden_ssh ;;\n    firewall) firewall_on ;;\n    firewall-confirm) firewall_confirm ;;\n    firewall-off) firewall_off ;;\n    updates) auto_updates ;;\n    *) sed -n \'2,11p\' "$0" | sed \'s/^# \\{0,1\\}//\'; exit 2 ;;\nesac\n'),
+    ('deploy/firewall.nft', 0o644,
+     '#!/usr/sbin/nft -f\n# Phase 14 firewall, loaded by surveillance-firewall.service (deploy/harden.sh installs it).\n#\n# Nothing on the home network or the internet can open a connection to the Pi. Only devices in\n# your tailnet reach SSH (22) and the camera page (443, tailscale serve), and the Tailscale\n# access policy narrows that to your own devices. Connections the Pi opens itself (updates,\n# time, Tailscale) and their answers are not affected.\n#\n# This is its own table: Tailscale keeps its own firewall rules, and they are left alone.\n\ntable inet cctv_filter\ndelete table inet cctv_filter\n\ntable inet cctv_filter {\n    chain input {\n        type filter hook input priority filter; policy drop;\n\n        iif "lo" accept\n        ct state established,related accept\n        ct state invalid drop\n\n        # Error messages both IP versions need, IPv6 neighbour discovery, and rate-limited ping.\n        icmp type { destination-unreachable, time-exceeded, parameter-problem } accept\n        icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem,\n                      nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept\n        icmp type echo-request limit rate 5/second accept\n        icmpv6 type echo-request limit rate 5/second accept\n\n        # Address assignment from the router (DHCP, DHCPv6).\n        udp sport 67 udp dport 68 accept\n        udp sport 547 udp dport 546 accept\n\n        # Tailscale\'s encrypted WireGuard packets (direct connections between your devices).\n        udp dport 41641 accept\n\n        # Inside the tailnet only: SSH and the camera web page.\n        iifname "tailscale0" tcp dport { 22, 443 } accept\n\n        counter comment "dropped"\n    }\n\n    chain forward {\n        type filter hook forward priority filter; policy drop;\n    }\n}\n'),
+    ('deploy/surveillance-firewall.service', 0o644,
+     '# Phase 14 firewall (deploy/firewall.nft). Installed and enabled by deploy/harden.sh.\n# Emergency off (from a keyboard and screen on the Pi):  sudo systemctl disable --now surveillance-firewall\n[Unit]\nDescription=Surveillance camera firewall (only the tailnet reaches SSH and the web page)\nDefaultDependencies=no\nBefore=network-pre.target shutdown.target\nWants=network-pre.target\nConflicts=shutdown.target\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/sbin/nft -f /opt/surveillance/deploy/firewall.nft\nExecStop=/usr/sbin/nft delete table inet cctv_filter\n\n[Install]\nWantedBy=sysinit.target\n'),
+    ('deploy/sshd-hardening.conf', 0o644,
+     '# Installed as /etc/ssh/sshd_config.d/10-surveillance.conf by deploy/harden.sh (Phase 14).\n# The name starts with 10- so it is read before other drop-ins such as 50-cloud-init.conf:\n# for sshd the first value it finds for a setting wins.\n\n# Only keys; no passwords, no keyboard-interactive, no root, only your account.\nPubkeyAuthentication yes\nAuthenticationMethods publickey\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitEmptyPasswords no\nPermitRootLogin no\nAllowUsers ADMIN_USER\n\nMaxAuthTries 3\nMaxSessions 4\nLoginGraceTime 30\nClientAliveInterval 300\nClientAliveCountMax 2\n\n# `ssh -L` (the tunnel to the web page) keeps working; everything else is switched off.\nAllowTcpForwarding local\nAllowStreamLocalForwarding no\nAllowAgentForwarding no\nX11Forwarding no\nPermitTunnel no\nGatewayPorts no\n'),
+    ('deploy/apt-auto-upgrades.conf', 0o644,
+     '// Installed as /etc/apt/apt.conf.d/20auto-upgrades by deploy/harden.sh (Phase 14).\n// Every day: refresh the package lists and install Debian stable and security updates (the\n// unattended-upgrades default selection). Raspberry Pi packages (kernel, firmware, libcamera,\n// picamera2) are left for a monthly manual update, so a change there never surprises a camera\n// nobody is watching.\nAPT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\nAPT::Periodic::AutocleanInterval "7";\n'),
+    ('tools/phase14_security_audit.py', 0o644,
+     '#!/usr/bin/env python3\n"""Phase 14: read-only security audit of the Pi (run as root, it reads system files).\n\n    sudo python3 /opt/surveillance/tools/phase14_security_audit.py\n\nChecks what is really in effect, not what the configuration files say: the SSH server\'s\neffective settings and keys, the firewall, which ports listen and whether anything outside\nthe tailnet can reach them, sudo rules, automatic updates, the service sandboxes, file\npermissions and login accounts. Changes nothing.\n"""\nfrom __future__ import annotations\n\nimport json\nimport os\nimport pwd\nimport re\nimport stat\nimport subprocess\nimport sys\nfrom pathlib import Path\n\nAPP = Path("/opt/surveillance")\nDATA_DIRS = (Path("/etc/surveillance"), Path("/var/lib/surveillance"), Path("/var/log/surveillance"))\nSERVICES = ("surveillance-recorder", "surveillance-web", "surveillance-health")\nFIREWALL = "surveillance-firewall"\nTAILNET_ONLY_PORTS = {22, 443}\nMAX_EXPOSURE = 2.0\n\nresults: list[str] = []\n\n\ndef report(status: str, text: str) -> None:\n    results.append(status)\n    print(f"  [{status}] {text}")\n\n\ndef run(args: list[str]) -> subprocess.CompletedProcess:\n    try:\n        return subprocess.run(args, capture_output=True, text=True, timeout=60, check=False)\n    except (OSError, subprocess.TimeoutExpired) as exc:\n        return subprocess.CompletedProcess(args, 127, "", str(exc))\n\n\ndef check_ssh() -> None:\n    print("SSH server")\n    out = run(["sshd", "-T"])\n    if out.returncode != 0:\n        report("FAIL", f"cannot read the SSH server settings: {out.stderr.strip()[:200]}")\n        return\n    cfg: dict[str, str] = {}\n    for line in out.stdout.splitlines():\n        key, _, value = line.partition(" ")\n        cfg.setdefault(key, value)\n    expected = {"passwordauthentication": "no", "kbdinteractiveauthentication": "no", "permitrootlogin": "no",\n                "pubkeyauthentication": "yes", "permitemptypasswords": "no", "x11forwarding": "no",\n                "authenticationmethods": "publickey"}\n    for key, want in expected.items():\n        got = cfg.get(key, "?")\n        report("PASS" if got == want else "FAIL", f"{key} {got}" + ("" if got == want else f" (should be {want})"))\n    forwarding = cfg.get("allowtcpforwarding", "?")\n    report("PASS" if forwarding in ("local", "no") else "WARN", f"allowtcpforwarding {forwarding}")\n    tries = int(cfg.get("maxauthtries", "6") or 6)\n    report("PASS" if tries <= 3 else "WARN", f"maxauthtries {tries}")\n    users = cfg.get("allowusers", "").split()\n    report("PASS" if users else "WARN", f"allowusers {\' \'.join(users) or \'(anyone)\'}")\n    for name in users:\n        try:\n            home = Path(pwd.getpwnam(name).pw_dir)\n        except KeyError:\n            continue\n        keys_file = home / ".ssh" / "authorized_keys"\n        try:\n            keys = [line for line in keys_file.read_text().splitlines() if re.match(r"^(ssh-|ecdsa-|sk-)", line)]\n        except OSError:\n            keys = []\n        report("PASS" if keys else "FAIL", f"{name}: {len(keys)} key(s) in {keys_file}")\n        for path, limit in ((home, 0o755), (home / ".ssh", 0o700), (keys_file, 0o600)):\n            try:\n                mode = stat.S_IMODE(path.stat().st_mode)\n            except OSError:\n                continue\n            report("PASS" if mode & ~limit == 0 else "FAIL", f"{path} permissions {mode:o}")\n    prefs = run(["tailscale", "debug", "prefs"])\n    if prefs.returncode == 0:\n        try:\n            tailscale_ssh = json.loads(prefs.stdout).get("RunSSH", False)\n            report("PASS" if not tailscale_ssh else "WARN",\n                   "Tailscale SSH off (OpenSSH with keys is used)" if not tailscale_ssh else "Tailscale SSH is on")\n        except ValueError:\n            pass\n\n\ndef check_firewall() -> set[int]:\n    print("Firewall")\n    active = run(["systemctl", "is-active", FIREWALL]).stdout.strip() == "active"\n    enabled = run(["systemctl", "is-enabled", FIREWALL]).stdout.strip() == "enabled"\n    report("PASS" if active and enabled else "FAIL",\n           f"{FIREWALL}: {\'active\' if active else \'NOT active\'}, {\'on at boot\' if enabled else \'NOT on at boot\'}")\n    chain = run(["nft", "list", "chain", "inet", "cctv_filter", "input"]).stdout\n    report("PASS" if "policy drop" in chain else "FAIL", "incoming connections are dropped unless allowed"\n           if "policy drop" in chain else "the firewall table is not loaded")\n    if run(["systemctl", "is-enabled", "nftables"]).stdout.strip() == "enabled":\n        report("WARN", "nftables.service is enabled; its \'flush ruleset\' would also remove Tailscale\'s rules")\n    return TAILNET_ONLY_PORTS if active and "policy drop" in chain else set()\n\n\ndef check_ports(firewall_ports: set[int]) -> None:\n    print("Listening ports (what the network could reach)")\n    out = run(["ss", "-Hlntup"]).stdout\n    for line in sorted(set(out.splitlines())):\n        parts = line.split()\n        if len(parts) < 5:\n            continue\n        proto, local = parts[0], parts[4]\n        addr, _, port_text = local.rpartition(":")\n        addr = addr.strip("[]").split("%")[0]\n        if not port_text.isdigit() or addr in ("127.0.0.1", "::1") or addr.startswith("127."):\n            continue\n        port = int(port_text)\n        name = line.split(\'users:(("\', 1)[1].split(\'"\', 1)[0] if \'users:(("\' in line else "?"\n        where = f"{proto} {addr or \'*\'}:{port} ({name})"\n        tailnet_addr = addr.startswith("100.") or addr.startswith("fd7a:115c:a1e0")\n        if proto == "udp" and name == "tailscaled":\n            report("PASS", f"{where}: Tailscale\'s encrypted traffic")\n        elif not firewall_ports:\n            report("WARN", f"{where}: reachable from the home network (no firewall)")\n        elif proto == "tcp" and port in firewall_ports:\n            report("PASS", f"{where}: only through the tailnet (firewall)")\n        else:\n            report("PASS", f"{where}: blocked by the firewall" + (" (tailnet address)" if tailnet_addr else ""))\n\n\ndef check_sudo() -> None:\n    print("sudo")\n    files = [Path("/etc/sudoers"), *sorted(Path("/etc/sudoers.d").glob("*"))]\n    nopasswd = []\n    for path in files:\n        try:\n            lines = path.read_text().splitlines()\n        except OSError:\n            continue\n        nopasswd += [f"{path}: {line.strip()}" for line in lines if "NOPASSWD" in line and not line.lstrip().startswith("#")]\n    if nopasswd:\n        for entry in nopasswd:\n            report("WARN", f"sudo without a password: {entry}")\n    else:\n        report("PASS", "sudo always asks for the password")\n    members = run(["getent", "group", "sudo"]).stdout.strip().split(":")[-1]\n    report("PASS", f"members of the sudo group: {members or \'none\'}")\n\n\ndef check_updates() -> None:\n    print("Updates")\n    installed = run(["dpkg-query", "-W", "-f=${Status}", "unattended-upgrades"]).stdout.endswith("installed")\n    config = run(["apt-config", "dump"]).stdout\n    enabled = \'APT::Periodic::Unattended-Upgrade "1";\' in config\n    report("PASS" if installed and enabled else "FAIL",\n           "automatic security updates on" if installed and enabled else "automatic security updates are off")\n    timer = run(["systemctl", "is-enabled", "apt-daily-upgrade.timer"]).stdout.strip()\n    report("PASS" if timer == "enabled" else "WARN", f"apt-daily-upgrade.timer {timer}")\n    log = Path("/var/log/unattended-upgrades/unattended-upgrades.log")\n    if log.exists():\n        last = next((line for line in reversed(log.read_text(errors="replace").splitlines()) if line.strip()), "")\n        print(f"         last update run: {last[:110]}")\n    if Path("/run/reboot-required").exists():\n        report("WARN", "an update needs a reboot (Settings page, Restart Pi)")\n\n\ndef check_services() -> None:\n    print("Camera services")\n    for unit in SERVICES:\n        state = run(["systemctl", "is-active", unit]).stdout.strip()\n        out = run(["systemd-analyze", "security", f"{unit}.service", "--no-pager"]).stdout\n        match = re.search(r"Overall exposure level for \\S+: ([\\d.]+)", out)\n        exposure = float(match.group(1)) if match else 10.0\n        ok = state == "active" and exposure <= MAX_EXPOSURE\n        report("PASS" if ok else "WARN", f"{unit}: {state}, sandbox exposure {exposure:.1f} (0 best, 10 none)")\n    rule = Path("/etc/polkit-1/rules.d/50-surveillance.rules")\n    if rule.exists():\n        st = rule.stat()\n        report("PASS" if st.st_uid == 0 and stat.S_IMODE(st.st_mode) & 0o022 == 0 else "FAIL",\n               f"{rule}: owned by root, not writable by others")\n\n\ndef check_files() -> None:\n    print("File permissions")\n    writable = [p for p in [APP, *APP.rglob("*")] if p.lstat().st_uid != 0 or p.lstat().st_mode & 0o022]\n    report("PASS" if not writable else "FAIL", f"{APP}: owned by root and read-only to the services"\n           + (f"; {len(writable)} exception(s), e.g. {writable[0]}" if writable else ""))\n    for directory in DATA_DIRS:\n        if not directory.exists():\n            continue\n        others = [p for p in [directory, *directory.rglob("*")] if p.lstat().st_mode & 0o007]\n        report("PASS" if not others else "FAIL", f"{directory}: not readable by other users"\n               + (f"; {len(others)} exception(s), e.g. {others[0]}" if others else ""))\n    for path in (Path("/usr/local/sbin/cctv-tool"), *Path("/etc/systemd/system").glob("surveillance-*.service")):\n        if path.exists():\n            st = path.lstat()\n            report("PASS" if st.st_uid == 0 and st.st_mode & 0o022 == 0 else "FAIL", f"{path}: root-owned, not writable by others")\n\n\ndef check_accounts() -> None:\n    print("Accounts")\n    logins = [u for u in pwd.getpwall() if u.pw_shell not in ("/usr/sbin/nologin", "/sbin/nologin", "/bin/false", "")\n              and (u.pw_uid >= 1000 or u.pw_uid == 0) and u.pw_name != "nobody"]\n    report("PASS", f"accounts that can log in: {\', \'.join(u.pw_name for u in logins)}")\n    status = run(["passwd", "-S", "root"]).stdout.split()\n    locked = len(status) > 1 and status[1] in ("L", "LK", "NP")\n    report("PASS" if locked else "WARN", "root has no usable password" if locked else "root has a password set")\n    try:\n        cctv = pwd.getpwnam("cctv")\n        report("PASS" if cctv.pw_shell.endswith("nologin") else "FAIL", f"service user cctv: shell {cctv.pw_shell}")\n    except KeyError:\n        report("WARN", "service user cctv does not exist (Phase 13 not installed?)")\n\n\ndef main() -> int:\n    if os.geteuid() != 0:\n        print("Run it with sudo: sudo python3 /opt/surveillance/tools/phase14_security_audit.py", file=sys.stderr)\n        return 2\n    check_ssh()\n    firewall_ports = check_firewall()\n    check_ports(firewall_ports)\n    check_sudo()\n    check_updates()\n    check_services()\n    check_files()\n    check_accounts()\n    fails, warns = results.count("FAIL"), results.count("WARN")\n    verdict = "PROBLEMS FOUND" if fails else ("OK WITH WARNINGS" if warns else "HARDENED")\n    print(f"\\nRESULT: {verdict}  ({results.count(\'PASS\')} pass, {warns} warn, {fails} fail)")\n    return 1 if fails else 0\n\n\nif __name__ == "__main__":\n    sys.exit(main())\n'),
 ]
 
 texts = {}
 for rel, old, new in EDITS:
     text = texts.setdefault(rel, Path(rel).read_text())
     if text.count(old) != 1:
-        sys.exit(f"ABORTED, nothing changed: {rel} does not match the expected 0.13.1 code "
+        sys.exit(f"ABORTED, nothing changed: {rel} does not match the expected 0.13.2 code "
                  f"(found {text.count(old)} matches for:\n{old})")
     texts[rel] = text.replace(old, new)
 for rel, _mode, content in NEW_FILES:
@@ -101,62 +76,164 @@ for rel, mode, content in NEW_FILES:
     Path(rel).write_text(content)
     os.chmod(rel, mode)
     print(f"created {rel}")
-print("Update to 0.13.2 complete.")
+print("Update to 0.14.0 complete.")
 PYEOF
-python3 update_to_0_13_2.py
-sha256sum app/__init__.py app/main.py app/web_settings.py app/system_control.py web/templates/settings.html web/templates/power.html web/static/settings.js web/static/style.css deploy/install.sh deploy/polkit-surveillance.rules
+python3 update_to_0_14_0.py
+sha256sum app/__init__.py tools/phase12_tailscale_check.py deploy/harden.sh deploy/firewall.nft deploy/surveillance-firewall.service deploy/sshd-hardening.conf deploy/apt-auto-upgrades.conf tools/phase14_security_audit.py
+sudo bash ~/surveillance/deploy/install.sh
 ```
 
 Expected checksums:
 
 ```
-0b5d5ba0e3f7e13208aa526914efac646843d9c1147560e601f30ed5e374addd  app/__init__.py
-248130a6b9a1966d701199edef6b0a05719b98a570be20492f24d8cc625f58b3  app/main.py
-5a4e8f848ead733d0b971991ba44c10cab413b82476f380c77918a60efb921bb  app/web_settings.py
-bf0ab9aaceb972a936e619b295f0efabebdb223c18cc01b0cc6bb2ea910d8373  app/system_control.py
-2f319fb505310a186b81df0ef8efd7a29742847341ad42fa9b47058aa9f6cf27  web/templates/settings.html
-45390f00fd175dd96b3945525952e49c32b616d544300982597129c758b9d13f  web/templates/power.html
-7927b422d269c472ee4c985452259279141c5f23833b6c1b40a28247b33dee82  web/static/settings.js
-10bab73a5a51356050575eaae19df59964b129c8dc7690cd83a7e85d62e0cec9  web/static/style.css
-d395288187f59d6faa76fff9ff5958e35f6ce87e19e9892a8d7596e364486514  deploy/install.sh
-d237237ded8de53942bd8d3f26a717499f2ba625dadd0aec6920c35372a41f16  deploy/polkit-surveillance.rules
+f44da4762ba8484e23b8e381d5efeeb018247aa8d05cfe8b0cabfbba66c28c6e  app/__init__.py
+3496a0288c4c7bea3f9057c0ac10e5cb77f6b28d7746bb390dfde589fb7143c9  tools/phase12_tailscale_check.py
+81e3f87b30633032b335b12c2ac12e067b246d697318239b8cfdc03629abfa75  deploy/harden.sh
+557f1b22f6fcd4443ee3267221446090923206ae418935cd6cf32fe9f73402f1  deploy/firewall.nft
+1dce7cdbadf58265098804c798fa93edba9ccaeea7f66c633a0d7560d4608086  deploy/surveillance-firewall.service
+77759b2e214047c1aa25799e8cb7e36de08fc372dda80130faa82dc855f7bf32  deploy/sshd-hardening.conf
+2decc65d5b15f3942f471f154b365bfbac0d389951e90c0fef6b56029672a3e1  deploy/apt-auto-upgrades.conf
+ba2cf4fd9a42866fdf401dc8c54cd0a981c4115c694d89140f35c9bd55829567  tools/phase14_security_audit.py
 ```
 
-## Step 2 — Deploy
+The installer should end with `version 0.14.0` and three services each `active, 0 restart(s)`.
+
+## Step 2 — Create an SSH key on your Windows laptop
+
+Open **PowerShell** on the laptop:
+
+```powershell
+ssh-keygen -t ed25519 -C "laptop-cam01"
+```
+
+- Press Enter to accept the default file location. If it asks to overwrite an existing key, answer `n` and just use the one you have.
+- Choose a **passphrase**. It protects the key if the laptop is stolen.
+
+Copy the public key to the Pi over the tailnet. This asks for the Pi password one last time. The first connection to the name `cam01` also asks you to accept its fingerprint: type `yes`.
+
+```powershell
+type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh ysak@cam01 "umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys"
+ssh ysak@cam01
+```
+
+The second command should ask for your **key passphrase** (`Enter passphrase for key ...`), not `ysak@cam01's password`. Stay logged in to this session for the next steps.
+
+A second key (from another computer, or a backup copy of this one) guards against losing the laptop. You can append more keys the same way.
+
+## Step 3 — SSH: keys only
+
+In the key session from Step 2:
 
 ```bash
-sudo bash ~/surveillance/deploy/install.sh
+sudo bash ~/surveillance/deploy/harden.sh ssh
 ```
 
-Expected: the usual output, plus the line `polkit rule installed (Restart / Shut down / time zone from the web page)`, then three services each `active, 0 restart(s)`. If it prints the polkit WARNING instead, run `sudo apt install polkitd` and run the installer again.
+Expected output:
 
-## Step 3 — Check that nothing else gets the permission
+```
+a key login for ysak was seen
+sshd reloaded (your current session stays open)
+  ...
+  passwordauthentication no
+  permitrootlogin no
+  allowusers ysak
+  authenticationmethods publickey
+```
 
-These run a command as `cctv`, but outside the web service:
+Keep that session open, and in a **new** PowerShell window check both of these:
+
+```powershell
+ssh ysak@cam01
+ssh -o PubkeyAuthentication=no ysak@cam01
+```
+
+The first should log you in with your key. The second should print `ysak@cam01: Permission denied (publickey).`
+
+If the first one fails, undo it from the session you kept open: `sudo rm /etc/ssh/sshd_config.d/10-surveillance.conf && sudo systemctl reload ssh`.
+
+## Step 4 — Firewall
 
 ```bash
-sudo systemd-run --quiet --wait --pipe --uid=cctv --gid=cctv timedatectl set-timezone UTC
-sudo systemd-run --quiet --wait --pipe --uid=cctv --gid=cctv busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanReboot
-timedatectl show -p Timezone --value
+sudo bash ~/surveillance/deploy/harden.sh firewall
 ```
 
-Expected: `Failed to set time zone: Interactive authentication required.`, then `s "challenge"`, then your unchanged zone (probably `Asia/Kuala_Lumpur`).
+It prints the rules and `It switches itself off at HH:MM:SS unless you confirm.` Within those 3 minutes, open a **new** PowerShell window and run:
 
-## Step 4 — Use it from the website
+```powershell
+ssh ysak@cam01
+```
 
-Open `https://cam01.tail1c1671.ts.net/settings` and scroll to the bottom.
+Then, in that new session:
 
-1. **Time zone:** the dropdown should show your current zone. Pick another zone with the same offset (for example `Asia/Singapore`), click **Set time zone**, and wait for the page to reload. Then run `timedatectl show -p Timezone --value` on the Pi; it should print the new zone. Change it back afterwards.
-2. **Wrong password:** type a wrong password into the Restart box and click **Restart Pi**, then OK in the dialog. Expected: `That password is wrong.`, and nothing restarts.
-3. **Real restart:** enter the right password, click **Restart Pi**, then OK. You should see "Restarting the Pi", and after about a minute the page should return to the Dashboard by itself, showing ONLINE.
-4. **Audit log:** open **Account** (your user name in the top bar). The latest entries should include `timezone changed`, `reauth failed` and `reboot`.
+```bash
+sudo bash ~/surveillance/deploy/harden.sh firewall-confirm
+```
 
-If a step shows "The system does not allow this (challenge)", your polkit build isn't seeing the web service's unit. Send me that message and the output of `dpkg -l polkitd dbus | tail -2`.
+Expected: `Firewall kept, and on at every boot`.
 
-Only test **Shut down Pi** when you can reach the Pi, because it stays off until you unplug and replug its power.
+Now check that the home network is shut out. On the Pi, run `hostname -I` and note the first address (for example `192.168.0.50`). Then in PowerShell on the laptop:
 
-Please send me the checksums and the results of Steps 2 to 4. Next is Phase 14 (hardening):
-- SSH with keys only and no root login.
-- SSH reachable only over the tailnet, enforced by a firewall.
-- Automatic security updates.
-- A final audit of ports and file permissions.
+```powershell
+Test-NetConnection 192.168.0.50 -Port 22
+```
+
+Expected: `TcpTestSucceeded : False` after a few seconds. Also check that `https://cam01.tail1c1671.ts.net` still works from the laptop and from the phone on mobile data.
+
+From now on, always connect with `ssh ysak@cam01`. The old `ysak.local` name no longer resolves, because the firewall blocks that lookup too, and SSH over the home network is blocked anyway.
+
+## Step 5 — Automatic updates
+
+```bash
+sudo bash ~/surveillance/deploy/harden.sh updates
+```
+
+Expected:
+- `APT::Periodic::Unattended-Upgrade "1";`
+- The origin patterns: `label=Debian` and `label=Debian-Security`.
+- Two timers with their next run times.
+- A trial-run summary.
+
+Once a month, update the Raspberry Pi packages by hand:
+
+```bash
+sudo apt update && sudo apt full-upgrade
+sudo reboot
+```
+
+After the reboot, check the dashboard.
+
+## Step 6 — Audit
+
+```bash
+sudo python3 /opt/surveillance/tools/phase14_security_audit.py
+sudo cctv-tool phase12_tailscale_check
+```
+
+Expected: the audit ends with `RESULT: HARDENED` or `OK WITH WARNINGS`, and 0 fail. The Tailscale check should now report SSH as `the firewall blocks it from the home network (open inside the tailnet)`, with no warnings.
+
+- If the audit warns `sudo without a password: /etc/sudoers.d/010_pi-nopasswd`, send it to me. Raspberry Pi OS sometimes installs that file, and it should go.
+- Any other WARN or FAIL, send the line as it is.
+
+**If you ever lock yourself out:** SSH changes don't affect logging in locally. Connect a keyboard and screen to the Pi, log in with your password, and run either of these:
+
+```bash
+sudo systemctl disable --now surveillance-firewall
+sudo rm /etc/ssh/sshd_config.d/10-surveillance.conf && sudo systemctl reload ssh
+```
+
+**What's still true (not 100% secure):**
+- Anyone with your laptop *and* your key passphrase can log in over SSH.
+- Anyone with your Tailscale account and an approved device can reach the login page, but still needs the camera password.
+- The recordings on the SD card aren't encrypted, so whoever takes the Pi itself has the footage. Mounting it somewhere hard to reach helps.
+
+Please send me:
+1. The checksums.
+2. The results of Steps 3 to 5.
+3. The full audit output from Step 6.
+
+Then comes Phase 15, the stress tests:
+- a power cut while recording;
+- a full disk;
+- unplugging the camera;
+- losing the network;
+- a 72-hour soak test with CPU and temperature logging.
