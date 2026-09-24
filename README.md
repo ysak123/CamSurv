@@ -1,634 +1,900 @@
-Phase 10, the live view, is ready for you to test on the Pi. It passed all my tests here with the fake camera, but it hasn't touched your real camera yet. You'll need to restart both the recorder and the web interface after updating.
+Phase 11 (login and security) is ready for you to test on the Pi. It passed all my tests here in Chrome and with scripted attacks.
 
-## What Phase 10 adds
+## What Phase 11 adds
 
-**Live View page**
-- Video from the 640×480 low-resolution stream at about **7.5 frames/s**, compressed by the Pi 4's **hardware JPEG encoder**. The delay should be well under a second.
-- Standard MJPEG shown in a plain image element, so it works in every browser and uses your existing local-only connection.
-- A red **● LIVE** badge while frames arrive, plus **Pause** and **Full screen** buttons.
-- **The video only runs while someone is watching:**
-  - The camera starts encoding when the first viewer connects and stops when the last one leaves.
-  - The page closes the stream when you switch tabs or minimise the window, and after 10 minutes. You then get a **Resume** button.
-- **At most 3 viewers at once.** A 4th sees "Camera not reachable (… or too many viewers). Retrying…".
+**Accounts are created only on the Pi, over SSH.** There's deliberately no sign-up page in the browser, which a stranger could otherwise reach first. `tools/manage_users.py` has `create`, `passwd`, `list`, `unlock`, `logout` and `log`.
 
-**Dashboard**
-- The placeholder box now shows the **latest camera image, refreshed every 10 s**. Tap it to open the live view.
-- Each snapshot is a single frame compressed in software, so the live encoder isn't started and stopped every 10 s.
+**Passwords**
+- **At least 15 characters,** and not the username or a very common password. There are no "must include a symbol" rules: a long passphrase is stronger.
+- **Hashed with Argon2id** using the RFC 9106 settings (64 MiB, 3 passes, 4 lanes). Each check deliberately takes a few hundred milliseconds on the Pi, so guessing is slow and expensive.
+- **At most two checks run at once,** so a flood of login attempts can't use up the Pi's memory.
 
-**Safety for recording**
-- The live view encodes the low-resolution stream the motion detector already uses, so the recording itself isn't touched.
-- If anything in the live view fails, it's logged and recording carries on. If the hardware JPEG encoder can't start, it falls back to software JPEG automatically.
-- The web app talks to the recorder through a socket file readable only by your user (`srw-------`) in the RAM folder.
+**Protection against guessing**
+- **Username lockout:** after 5 wrong passwords, that username is locked for 30 s, then 60 s, 2 min and so on, up to 15 min. **This applies to invented usernames too.**
+- **Global limit:** more than 30 failures in 10 minutes pauses all logins for a while.
+- The counters are stored in the database, so restarting doesn't reset them.
+- If you ever lock yourself out, run `manage_users.py unlock`.
 
-**New settings** (in the `live` section):
+**Sessions**
+- A 256-bit random token in a cookie that JavaScript can't read. It's only sent over secure connections, never to other websites, and only to this exact address.
+- The database stores only a hash of the token, so a copy of the database contains no usable logins.
+- You're logged out after 30 minutes idle, or 12 hours at most.
+- Changing your password logs out every other session, and the Account page has a "Log out all other sessions" button.
 
-| Setting | Default | Range |
-|---|---|---|
-| `enabled` | true | true / false |
-| `max_fps` | 8 | 1–30 |
-| `quality` | medium | low / medium / high |
-| `max_viewers` | 3 | 1–6 |
-| `max_view_minutes` | 10 | 1–240 |
+**Every page, stream and file is protected.** Pages redirect to the login page. The API, live stream, snapshot, video and downloads answer `401`. Only the login page and the style/script files are public.
+
+**Cross-site attacks (CSRF) are blocked.** Every form must come from the camera's own pages, and must carry a secret token unique to your session.
+
+**Security log.** Logins, failures, lockouts, password changes and logouts are shown on the Account page and by `manage_users.py log`.
+
+**Files:**
+- `auth.db` is created readable only by your user (`-rw-------`).
+- New settings in the `auth` section: `idle_timeout_minutes` (default 30), `session_max_hours` (12) and `lockout_threshold` (5).
+
+## Two problems my tests caught and I fixed
+
+1. **Every login would have failed.** The pages told browsers `Referrer-Policy: no-referrer`, and under that policy browsers label every form post as coming from origin `null`. My same-origin check would then have rejected all logins. It's now `same-origin`: the browser still never sends the camera's address to other websites.
+2. **The lockout revealed which usernames exist.** Only real accounts got locked, so after 5 guesses an attacker would see "Too many attempts" for real usernames and "Wrong username or password" for invented ones. Every attempted username now gets the same treatment.
 
 ## What I tested here
 
-This machine has no hardware JPEG encoder, which conveniently exercised the software fallback.
+**In Chrome:**
+- The cookie was accepted with all its protections, even over plain `http://127.0.0.1` through the tunnel.
+- JavaScript can't read the cookie.
+- A same-site POST without the CSRF token got `403`.
+- Changing the password needs the current one.
+- A session idle for 60 minutes bounced to the login page.
+- Logout ends the session on the server; the API then answers `401`.
+- Live view, video playback and the dashboard snapshot all still work after logging in.
 
-- **Snapshot:** a valid 640×480 JPEG. **Stream:** 29 frames in 4 s, which is about 7.2 frames/s against the 7.5 target.
-- **Viewer limit:** 3 viewers were accepted and the 4th got `503`. After 20 connections that were cut off before their first frame, a new viewer still got in. **A leak I found and fixed:** a viewer that disconnected before the first frame would have used up a slot permanently.
-- **In Chrome:**
-  - The LIVE badge appeared.
-  - **Pause** made the recorder log `Live view stopped (no viewers)`, and **Resume** restarted it.
-  - Leaving the page for the dashboard stopped it too.
-  - No console errors.
-- **Recorder stopped:** snapshot and stream both return `503`, and the socket file is removed.
-- **Snapshot colours:** the dashboard snapshot came out **green** in my test. That was my fake camera, whose buffers have empty colour data. I checked the colour conversion on its own with a constructed image: grey came out as (120, 120, 120) and a red area as red.
-- **Update script:** turns your 0.9.0 files into files identical to the tested ones, and aborts safely if run twice.
+**With scripted attacks:**
+- Every protected route answers `302` (pages) or `401` (everything else) without a login.
+- A login from a foreign site got `403`.
+- **A real and an invented username behave identically:** "Wrong username or password" at about 53 ms four times, then "Too many failed attempts" at about 10 ms.
+- The correct password is also refused while the username is locked.
+
+**Update script:** turns your 0.10.0 files into files identical to the tested ones, and aborts safely if run twice.
+
+**Browser note:** Chrome, Edge and Firefox accept this kind of secure cookie on `http://localhost`. **Safari may not,** so please use one of the others through the tunnel for now. Once Tailscale gives the camera a real `https://` address in Phase 12, every browser works.
+
+## Install
+
+```bash
+sudo apt install -y python3-argon2
+python3 -c "import argon2; print('argon2 ok')"
+```
 
 ## Update the files
 
-No new packages are needed: `simplejpeg` comes with Picamera2. You can check with `python3 -c "import simplejpeg; print('ok')"`.
-
-**1. Stop the recorder and the web interface** (Ctrl+C in both windows). Then apply the update script, which changes 8 files and makes `.bak` backups:
+**1. Update script.** It changes `__init__.py`, `config.py`, `web.py`, `base.html`, `app.js` and `style.css`, making `.bak` backups:
 
 ```bash
 cd ~/surveillance
-cat > update_to_0_10_0.py <<'EOF'
+cat > update_to_0_11_0.py <<'EOF'
 #!/usr/bin/env python3
-"""Update the surveillance project from 0.9.0 to 0.10.0 (run from ~/surveillance)."""
+"""Update the surveillance project from 0.10.0 to 0.11.0 (run from ~/surveillance)."""
 import shutil, sys
 from pathlib import Path
 
 EDITS = [
     ('app/__init__.py',
-     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.9.0"\n',
-     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.10.0"\n'),
-    ('app/config.py',
-     'RETENTION_MODES = ("oldest_first",)\nLOCAL_WEB_HOSTS = ("127.0.0.1", "::1", "localhost")\nMAX_ENCODER_PIXELS = 1920 * 1080\nCAMERA_NAME_PATTERN = re.compile(r"^[\\w][\\w .,\'()-]{0,39}$")\n',
-     'RETENTION_MODES = ("oldest_first",)\nLOCAL_WEB_HOSTS = ("127.0.0.1", "::1", "localhost")\nLIVE_QUALITIES = ("low", "medium", "high")\nMAX_ENCODER_PIXELS = 1920 * 1080\nCAMERA_NAME_PATTERN = re.compile(r"^[\\w][\\w .,\'()-]{0,39}$")\n'),
+     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.10.0"\n',
+     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.11.0"\n'),
     ('app/config.py',
      '\n@dataclass(frozen=True)\nclass WebSettings:\n    host: str = "127.0.0.1"\n',
-     '\n@dataclass(frozen=True)\nclass LiveSettings:\n    enabled: bool = True\n    max_fps: float = 8.0\n    quality: str = "medium"\n    max_viewers: int = 3\n    max_view_minutes: int = 10\n\n    def validate(self) -> None:\n        _check_range("live.max_fps", self.max_fps, 1.0, 30.0)\n        if self.quality not in LIVE_QUALITIES:\n            raise ConfigError(f"live.quality must be one of: {\', \'.join(LIVE_QUALITIES)}")\n        _check_range("live.max_viewers", self.max_viewers, 1, 6)\n        _check_range("live.max_view_minutes", self.max_view_minutes, 1, 240)\n\n\n@dataclass(frozen=True)\nclass WebSettings:\n    host: str = "127.0.0.1"\n'),
+     '\n@dataclass(frozen=True)\nclass AuthSettings:\n    idle_timeout_minutes: int = 30\n    session_max_hours: int = 12\n    lockout_threshold: int = 5\n\n    def validate(self) -> None:\n        _check_range("auth.idle_timeout_minutes", self.idle_timeout_minutes, 5, 1440)\n        _check_range("auth.session_max_hours", self.session_max_hours, 1, 168)\n        _check_range("auth.lockout_threshold", self.lockout_threshold, 3, 20)\n\n\n@dataclass(frozen=True)\nclass WebSettings:\n    host: str = "127.0.0.1"\n'),
     ('app/config.py',
-     '    storage: StorageSettings = field(default_factory=StorageSettings)\n    motion: MotionSettings = field(default_factory=MotionSettings)\n    web: WebSettings = field(default_factory=WebSettings)\n    paths: PathSettings = field(default_factory=PathSettings)\n',
-     '    storage: StorageSettings = field(default_factory=StorageSettings)\n    motion: MotionSettings = field(default_factory=MotionSettings)\n    live: LiveSettings = field(default_factory=LiveSettings)\n    web: WebSettings = field(default_factory=WebSettings)\n    paths: PathSettings = field(default_factory=PathSettings)\n'),
-    ('app/recorder.py',
-     'from app.config import Settings\nfrom app.fileutil import fsync_directory, fsync_file\n\nlog = logging.getLogger("Recorder")\n',
-     'from app.config import Settings\nfrom app.fileutil import fsync_directory, fsync_file\nfrom app.streaming import LiveServer\n\nlog = logging.getLogger("Recorder")\n'),
-    ('app/recorder.py',
-     '        self._motion = None\n        self._motion_listeners: list[Callable] = []\n        self.last_segment: Segment | None = None\n\n',
-     '        self._motion = None\n        self._motion_listeners: list[Callable] = []\n        self._live = None\n        self.last_segment: Segment | None = None\n\n'),
-    ('app/recorder.py',
-     '                                               self._motion_listeners)\n            self._motion.start()\n\n    @staticmethod\n',
-     '                                               self._motion_listeners)\n            self._motion.start()\n        if self.settings.live.enabled:\n            self._start_live()\n\n    def _start_live(self) -> None:\n        try:\n            self._live = LiveServer(self._camera.picam2, self.settings)\n            self._live.start()\n        except Exception as exc:  # noqa: BLE001 - live view is optional; recording must continue\n            log.error("Live view unavailable: %s", exc)\n            self._live = None\n\n    @staticmethod\n'),
-    ('app/recorder.py',
-     '    def stop(self) -> None:\n        was_recording = self._recording\n        if self._motion is not None:\n            self._motion.stop()\n',
-     '    def stop(self) -> None:\n        was_recording = self._recording\n        if self._live is not None:\n            self._live.close()\n            self._live = None\n        if self._motion is not None:\n            self._motion.stop()\n'),
+     '    motion: MotionSettings = field(default_factory=MotionSettings)\n    live: LiveSettings = field(default_factory=LiveSettings)\n    web: WebSettings = field(default_factory=WebSettings)\n    paths: PathSettings = field(default_factory=PathSettings)\n',
+     '    motion: MotionSettings = field(default_factory=MotionSettings)\n    live: LiveSettings = field(default_factory=LiveSettings)\n    auth: AuthSettings = field(default_factory=AuthSettings)\n    web: WebSettings = field(default_factory=WebSettings)\n    paths: PathSettings = field(default_factory=PathSettings)\n'),
     ('app/web.py',
-     'from app.status import read_status\nfrom app.system_info import SystemInfo\nfrom app.web_recordings import create_blueprint\n\n',
-     'from app.status import read_status\nfrom app.system_info import SystemInfo\nfrom app.web_live import create_blueprint as create_live_blueprint\nfrom app.web_recordings import create_blueprint\n\n'),
+     'from app.status import read_status\nfrom app.system_info import SystemInfo\nfrom app.web_live import create_blueprint as create_live_blueprint\nfrom app.web_recordings import create_blueprint\n',
+     'from app.status import read_status\nfrom app.system_info import SystemInfo\nfrom app.web_auth import install as install_auth\nfrom app.web_live import create_blueprint as create_live_blueprint\nfrom app.web_recordings import create_blueprint\n'),
     ('app/web.py',
-     'NAVIGATION = [\n    ("dashboard", "Dashboard"),\n    ("live", "Live View"),\n    ("rec.recordings", "Recordings"),\n    ("rec.events", "Motion Events"),\n',
-     'NAVIGATION = [\n    ("dashboard", "Dashboard"),\n    ("live.live_page", "Live View"),\n    ("rec.recordings", "Recordings"),\n    ("rec.events", "Motion Events"),\n'),
+     '    "X-Content-Type-Options": "nosniff",\n    "X-Frame-Options": "DENY",\n    "Referrer-Policy": "no-referrer",\n    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",\n    "Cross-Origin-Opener-Policy": "same-origin",\n',
+     '    "X-Content-Type-Options": "nosniff",\n    "X-Frame-Options": "DENY",\n    # same-origin (not no-referrer): with no-referrer browsers send "Origin: null" on form posts,\n    # which would defeat the same-origin check that protects every POST.\n    "Referrer-Policy": "same-origin",\n    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",\n    "Cross-Origin-Opener-Policy": "same-origin",\n'),
     ('app/web.py',
-     '    app.config.update(JSON_SORT_KEYS=False, MAX_CONTENT_LENGTH=64 * 1024)\n    app.register_blueprint(create_blueprint(settings))\n    system_info = SystemInfo()\n\n',
-     '    app.config.update(JSON_SORT_KEYS=False, MAX_CONTENT_LENGTH=64 * 1024)\n    app.register_blueprint(create_blueprint(settings))\n    app.register_blueprint(create_live_blueprint(settings))\n    system_info = SystemInfo()\n\n'),
-    ('app/web.py',
-     '        return render_template("settings.html", title="Settings", page="settings_page", sections=asdict(settings))\n\n    @app.get("/live")\n    def live():\n        return render_template("placeholder.html", title="Live View", page="live", phase=10,\n                               text="Live view is added in Phase 10.")\n\n    @app.get("/api/status")\n    def api_status():\n',
-     '        return render_template("settings.html", title="Settings", page="settings_page", sections=asdict(settings))\n\n    @app.get("/api/status")\n    def api_status():\n'),
-    ('app/web_main.py',
-     '\nWEB_LOG_FILE = "web.log"\nWORKER_THREADS = 6\n\n\n',
-     '\nWEB_LOG_FILE = "web.log"\n# Each live viewer holds one worker thread for as long as it watches; keep spare threads for pages.\nSPARE_WORKER_THREADS = 4\n\n\n'),
-    ('app/web_main.py',
-     '    host, port = settings.web.host, settings.web.port\n    log.info("Web interface %s listening on http://%s:%d (local only)", __version__, host, port)\n    serve(create_app(settings), host=host, port=port, threads=WORKER_THREADS, ident="",\n          clear_untrusted_proxy_headers=True)\n    return 0\n\n',
-     '    host, port = settings.web.host, settings.web.port\n    log.info("Web interface %s listening on http://%s:%d (local only)", __version__, host, port)\n    serve(create_app(settings), host=host, port=port, threads=settings.live.max_viewers + SPARE_WORKER_THREADS,\n          ident="", clear_untrusted_proxy_headers=True)\n    return 0\n\n'),
-    ('web/templates/dashboard.html',
-     '{% block content %}\n<section class="live-box" aria-label="Live camera">\n  <div class="live-placeholder">\n    <span class="live-title">LIVE CAMERA</span>\n    <span class="muted">Live view is added in Phase 10</span>\n  </div>\n</section>\n\n',
-     '{% block content %}\n<section class="live-box" aria-label="Live camera">\n  <a class="snapshot-link" href="{{ url_for(\'live.live_page\') }}">\n    <img id="snapshot" class="snapshot" alt="Latest camera image" hidden>\n    <span class="live-placeholder" id="snapshot-placeholder">\n      <span class="live-title">LIVE CAMERA</span>\n      <span class="muted" id="snapshot-message">Loading the latest image…</span>\n    </span>\n    <span class="snapshot-hint">Open live view &rarr;</span>\n  </a>\n</section>\n\n'),
+     '            abort(400)\n\n    @app.after_request\n    def security_headers(response):\n',
+     '            abort(400)\n\n    # Registered after the Host check, so it runs second: login, CSRF and same-origin checks.\n    install_auth(app, settings)\n\n    @app.after_request\n    def security_headers(response):\n'),
+    ('web/templates/base.html',
+     '  <meta charset="utf-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1">\n  <meta name="referrer" content="no-referrer">\n  <link rel="icon" href="data:,">\n  <title>{{ title }} · {{ camera_name }}</title>\n',
+     '  <meta charset="utf-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1">\n  <meta name="referrer" content="same-origin">\n  <link rel="icon" href="data:,">\n  <title>{{ title }} · {{ camera_name }}</title>\n'),
+    ('web/templates/base.html',
+     '  {% block scripts %}{% endblock %}\n</head>\n<body data-refresh="{{ refresh_ms }}">\n  <header class="topbar">\n    <div class="brand">\n',
+     '  {% block scripts %}{% endblock %}\n</head>\n<body data-refresh="{{ refresh_ms }}" data-auth="{{ \'1\' if current_user else \'0\' }}">\n  <header class="topbar">\n    <div class="brand">\n'),
+    ('web/templates/base.html',
+     '      </div>\n    </div>\n    <p class="clock" id="updated-at" aria-live="polite">connecting…</p>\n  </header>\n  <nav class="nav" aria-label="Main">\n    {% for endpoint, label in navigation %}\n      <a href="{{ url_for(endpoint) }}" {% if page == endpoint %}class="active" aria-current="page"{% endif %}>{{ label }}</a>\n    {% endfor %}\n  </nav>\n  <div class="banner" id="connection-banner" role="alert" hidden>Cannot reach the camera. Retrying…</div>\n  <main>\n',
+     '      </div>\n    </div>\n    {% if current_user %}<p class="clock" id="updated-at" aria-live="polite">connecting…</p>{% endif %}\n  </header>\n  {% if current_user %}\n  <nav class="nav" aria-label="Main">\n    {% for endpoint, label in navigation %}\n      <a href="{{ url_for(endpoint) }}" {% if page == endpoint %}class="active" aria-current="page"{% endif %}>{{ label }}</a>\n    {% endfor %}\n    <span class="nav-spacer"></span>\n    <a href="{{ url_for(\'auth.account\') }}" {% if page == \'auth.account\' %}class="active" aria-current="page"{% endif %}>{{ current_user }}</a>\n    <form method="post" action="{{ url_for(\'auth.logout\') }}" class="nav-form">\n      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">\n      <button type="submit" class="nav-button">Log out</button>\n    </form>\n  </nav>\n  {% endif %}\n  <div class="banner" id="connection-banner" role="alert" hidden>Cannot reach the camera. Retrying…</div>\n  <main>\n'),
     ('web/static/app.js',
-     '  });\n  refresh();\n})();\n',
-     '  });\n  refresh();\n\n  // Dashboard: a still image refreshed every 10 s (a single frame, not the live encoder).\n  const snapshot = document.getElementById("snapshot");\n  if (snapshot) {\n    const placeholder = document.getElementById("snapshot-placeholder");\n    const note = document.getElementById("snapshot-message");\n    snapshot.addEventListener("load", () => { snapshot.hidden = false; placeholder.hidden = true; });\n    snapshot.addEventListener("error", () => {\n      snapshot.hidden = true;\n      placeholder.hidden = false;\n      note.textContent = "Camera image not available";\n    });\n    const refreshSnapshot = () => {\n      if (document.visibilityState === "visible") snapshot.src = `/live/snapshot.jpg?ts=${Date.now()}`;\n    };\n    refreshSnapshot();\n    setInterval(refreshSnapshot, 10000);\n  }\n})();\n'),
+     '// Only textContent is ever set, so nothing from the server can be interpreted as HTML.\n(() => {\n  const refreshMs = Number(document.body.dataset.refresh) || 5000;\n  let timer = null;\n',
+     '// Only textContent is ever set, so nothing from the server can be interpreted as HTML.\n(() => {\n  if (document.body.dataset.auth !== "1") return;   // login page: nothing to poll\n  const refreshMs = Number(document.body.dataset.refresh) || 5000;\n  let timer = null;\n'),
+    ('web/static/app.js',
+     '    try {\n      const response = await fetch("/api/status", { cache: "no-store", credentials: "same-origin" });\n      if (!response.ok) throw new Error(`HTTP ${response.status}`);\n      render(await response.json());\n',
+     '    try {\n      const response = await fetch("/api/status", { cache: "no-store", credentials: "same-origin" });\n      if (response.status === 401) {   // session expired or logged out elsewhere\n        window.location.href = `/login?msg=expired&next=${encodeURIComponent(location.pathname + location.search)}`;\n        return;\n      }\n      if (!response.ok) throw new Error(`HTTP ${response.status}`);\n      render(await response.json());\n'),
     ('web/static/style.css',
-     '  table.list td.actions { flex-direction: column; align-items: stretch; }\n}\n',
-     '  table.list td.actions { flex-direction: column; align-items: stretch; }\n}\n\n/* ---- Phase 10: live view ---- */\n[hidden] { display: none !important; }\n\n.snapshot-link {\n  position: relative;\n  display: grid;\n  place-items: center;\n  width: 100%;\n  height: 100%;\n  color: inherit;\n  text-decoration: none;\n}\n.snapshot { width: 100%; height: 100%; object-fit: contain; border-radius: var(--radius); background: #000; }\n.snapshot-hint {\n  position: absolute;\n  right: .75rem;\n  bottom: .75rem;\n  padding: .25rem .6rem;\n  border-radius: 6px;\n  background: rgba(0, 0, 0, .65);\n  font-size: .8rem;\n}\n\n.live-frame {\n  position: relative;\n  width: 100%;\n  aspect-ratio: 4 / 3;\n  max-height: 75vh;\n  margin: 0 auto;\n  overflow: hidden;\n  border-radius: 8px;\n  background: #000;\n  display: grid;\n  place-items: center;\n}\n.live-frame img { width: 100%; height: 100%; object-fit: contain; }\n.live-frame:fullscreen { max-height: none; border-radius: 0; }\n.live-overlay {\n  position: absolute;\n  inset: 0;\n  display: grid;\n  place-content: center;\n  justify-items: center;\n  gap: .75rem;\n  padding: 1rem;\n  text-align: center;\n  background: rgba(0, 0, 0, .6);\n}\n.live-badge {\n  position: absolute;\n  left: .75rem;\n  top: .75rem;\n  padding: .2rem .55rem;\n  border-radius: 6px;\n  background: rgba(0, 0, 0, .65);\n  color: var(--bad);\n  font-size: .8rem;\n  font-weight: 700;\n  letter-spacing: .05em;\n}\n'),
+     '  letter-spacing: .05em;\n}\n',
+     '  letter-spacing: .05em;\n}\n\n/* ---- Phase 11: login and account ---- */\n.nav { align-items: center; }\n.nav-spacer { flex: 1; }\n.nav-form { margin: 0; }\n.nav-button {\n  padding: .45rem .8rem;\n  border: 0;\n  border-radius: 8px;\n  background: none;\n  color: var(--muted);\n  font: inherit;\n  font-size: .9rem;\n  cursor: pointer;\n}\n.nav-button:hover { color: var(--text); background: var(--panel-2); }\n\n.login-panel { max-width: 420px; width: 100%; margin: 2rem auto; }\nform.stack { display: grid; gap: .9rem; }\nform.stack.narrow { max-width: 420px; }\nform.stack label { display: grid; gap: .3rem; color: var(--muted); font-size: .85rem; }\nform.stack input[type="text"], form.stack input[type="password"] {\n  padding: .6rem .7rem;\n  border: 1px solid var(--border);\n  border-radius: 8px;\n  background: var(--bg);\n  color: var(--text);\n  font: inherit;\n  font-size: 1rem;\n}\nform.stack input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }\n'),
 ]
 
 texts = {}
 for rel, old, new in EDITS:
     text = texts.setdefault(rel, Path(rel).read_text())
     if text.count(old) != 1:
-        sys.exit(f"ABORTED, nothing changed: {rel} does not match the expected 0.9.0 code "
+        sys.exit(f"ABORTED, nothing changed: {rel} does not match the expected 0.10.0 code "
                  f"(found {text.count(old)} matches for:\n{old})")
     texts[rel] = text.replace(old, new)
 for rel, text in texts.items():
     shutil.copy2(rel, rel + ".bak")
     Path(rel).write_text(text)
     print(f"updated {rel}  (backup: {rel}.bak)")
-print("Update to 0.10.0 complete.")
+print("Update to 0.11.0 complete.")
 EOF
-python3 update_to_0_10_0.py
+python3 update_to_0_11_0.py
 ```
 
-It should print eight `updated …` lines and then `Update to 0.10.0 complete.`
-
-**2. New file `app/streaming.py`** (the recorder side):
+**2. New file `app/auth.py`:**
 
 ```bash
-cat > ~/surveillance/app/streaming.py <<'EOF'
-"""Live view source inside the recorder process (Phase 10).
+cat > ~/surveillance/app/auth.py <<'EOF'
+"""Accounts, password hashing, sessions, brute-force protection and the audit log (Phase 11).
 
-The recorder listens on a Unix socket (<runtime_dir>/live.sock, owner-only permissions).
-The web process connects and sends one command line:
-
-    STREAM\\n    -> a stream of JPEG frames until either side disconnects
-    SNAPSHOT\\n  -> exactly one JPEG frame
-
-Each frame is sent as a 4-byte big-endian length followed by the JPEG bytes.
-
-The JPEG encoder only runs while at least one STREAM client is connected. It encodes the
-low-resolution stream that the camera already produces for motion detection, using the
-Pi 4's hardware JPEG encoder (software JPEG as fallback), so the recording is not touched.
-Every client only ever receives the newest frame, so a slow viewer cannot hold anything up.
+Design:
+  * Passwords are hashed with Argon2id (RFC 9106 low-memory profile: 64 MiB, 3 passes, 4 lanes).
+  * At most two hashes are computed at once, so a flood of login attempts cannot exhaust RAM.
+  * Unknown usernames are checked against a dummy hash, so response time does not reveal
+    which usernames exist.
+  * Failed logins lock the attempted username with a growing delay, whether or not the account
+    exists (so the lockout message cannot reveal real usernames); a global cap limits guessing
+    across all usernames. Counters are stored in the database, so a restart does not reset them.
+  * Session tokens are 256-bit random values. Only their SHA-256 is stored, so a copy of the
+    database does not contain usable sessions.
+  * Sessions end after an idle period and after a maximum age; changing the password ends all
+    other sessions.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
-import math
 import os
-import socket
-import struct
+import re
+import secrets
+import sqlite3
 import threading
+import time
+from contextlib import closing
 from pathlib import Path
 
-import simplejpeg
-from picamera2.encoders import JpegEncoder, MJPEGEncoder, Quality
-from picamera2.outputs import Output
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 
-log = logging.getLogger("LiveStream")
+log = logging.getLogger("Auth")
 
-SOCKET_NAME = "live.sock"
-COMMAND_MAX_BYTES = 32
-CLIENT_TIMEOUT_S = 10.0
-FRAME_WAIT_S = 5.0
-SNAPSHOT_QUALITY = 85
-SOFTWARE_JPEG_QUALITY = 70
-QUALITY_LEVELS = {"low": Quality.LOW, "medium": Quality.MEDIUM, "high": Quality.HIGH}
+AUTH_DB_NAME = "auth.db"
+MIN_PASSWORD_LENGTH = 15
+MAX_PASSWORD_LENGTH = 256
+USERNAME_RE = re.compile(r"^[a-z][a-z0-9_.-]{2,31}$")
+TOKEN_BYTES = 32
+MAX_SESSIONS_PER_USER = 10
+SEEN_UPDATE_S = 60
+GLOBAL_WINDOW_S = 600
+GLOBAL_MAX_FAILURES = 30
+LOCK_BASE_S = 30
+LOCK_MAX_S = 900
+HASH_SLOT_WAIT_S = 10
+AUDIT_KEPT = 5000
+LOCKOUT_FORGET_S = 86400
+
+COMMON_PASSWORDS = {
+    "password", "passwordpassword", "password123456", "123456789012345", "1234567890123456",
+    "qwertyuiopasdfg", "qwertyuiopasdfgh", "iloveyouiloveyou", "adminadminadmin", "administrator123",
+    "letmeinletmein", "welcomewelcome1", "raspberrypi1234", "raspberrypiraspberrypi", "changemechangeme",
+    "correcthorsebatterystaple", "trustno1trustno1", "1q2w3e4r5t6y7u8i", "aaaaaaaaaaaaaaa",
+}
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id                  INTEGER PRIMARY KEY,
+    username            TEXT NOT NULL UNIQUE,
+    password_hash       TEXT NOT NULL,
+    created_at          INTEGER NOT NULL,
+    password_changed_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash  TEXT PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    csrf_token  TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    last_seen   INTEGER NOT NULL,
+    reauth_at   INTEGER NOT NULL,
+    user_agent  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE TABLE IF NOT EXISTS login_failures (at INTEGER NOT NULL);
+-- Keyed by the attempted username, existing or not.
+CREATE TABLE IF NOT EXISTS lockouts (
+    username      TEXT PRIMARY KEY,
+    failed        INTEGER NOT NULL,
+    locked_until  INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_log (
+    id        INTEGER PRIMARY KEY,
+    at        INTEGER NOT NULL,
+    username  TEXT,
+    action    TEXT NOT NULL,
+    detail    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log(at);
+"""
 
 
-def send_frame(conn: socket.socket, data: bytes) -> None:
-    conn.sendall(struct.pack(">I", len(data)) + data)
+class AuthError(ValueError):
+    pass
 
 
-def yuv420_to_jpeg(buffer, width: int, height: int, stride: int, quality: int) -> bytes:
-    frame = buffer.reshape(height * 3 // 2, stride)
-    y = frame[:height, :width]
-    chroma = frame.reshape(frame.shape[0] * 2, stride // 2)
-    u = chroma[2 * height: 2 * height + height // 2, : width // 2]
-    v = chroma[2 * height + height // 2:, : width // 2]
-    return simplejpeg.encode_jpeg_yuv_planes(y, u, v, quality)
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
-class _FrameHub(Output):
-    """Picamera2 output that keeps only the newest JPEG frame and wakes waiting clients."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._condition = threading.Condition()
-        self._frame: bytes | None = None
-        self._sequence = 0
-
-    def outputframe(self, frame, keyframe=True, timestamp=None, packet=None, audio=False) -> None:
-        with self._condition:
-            self._frame = bytes(frame)
-            self._sequence += 1
-            self._condition.notify_all()
-
-    def next_frame(self, after: int, timeout: float) -> tuple[int, bytes | None]:
-        with self._condition:
-            self._condition.wait_for(lambda: self._sequence != after, timeout=timeout)
-            return self._sequence, self._frame if self._sequence != after else None
+def normalize_username(username: str) -> str:
+    return username.strip().lower()
 
 
-class LiveServer:
-    def __init__(self, picam2, settings) -> None:
-        self._picam2 = picam2
-        self._live = settings.live
-        self._framerate = settings.camera.framerate
-        self._path: Path = settings.runtime_dir / SOCKET_NAME
-        self._hub = _FrameHub()
-        self._encoder = None
-        self._clients = 0
-        self._lock = threading.Lock()
-        self._closed = threading.Event()
-        self._server: socket.socket | None = None
-        self._thread = threading.Thread(target=self._accept_loop, name="live-accept", daemon=True)
+def safe_label(text: str) -> str:
+    """For the audit log: keep attempted usernames short and printable."""
+    return re.sub(r"[^a-z0-9_.@-]", "?", text.lower())[:32]
 
-    # ------------------------------------------------------------ lifecycle
-    def start(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._path.unlink(missing_ok=True)
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        old_umask = os.umask(0o177)  # the socket file is created owner-only (0600)
+
+def password_problem(password: str, username: str) -> str | None:
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return f"The password must be at least {MIN_PASSWORD_LENGTH} characters long (a passphrase works well)."
+    if len(password) > MAX_PASSWORD_LENGTH:
+        return f"The password must be at most {MAX_PASSWORD_LENGTH} characters long."
+    lowered = password.lower()
+    if lowered in COMMON_PASSWORDS or len(set(lowered)) < 5:
+        return "That password is too easy to guess."
+    if username and username.lower() in lowered:
+        return "The password must not contain the username."
+    return None
+
+
+class AuthStore:
+    def __init__(self, path: Path, idle_minutes: int, session_hours: int, lockout_threshold: int) -> None:
+        self.path = path
+        self._idle_s = idle_minutes * 60
+        self._max_age_s = session_hours * 3600
+        self._lock_threshold = lockout_threshold
+        self._hasher = PasswordHasher()
+        self._dummy_hash = self._hasher.hash(secrets.token_hex(16))
+        self._hash_slots = threading.BoundedSemaphore(2)
+
+    # ---------------------------------------------------------------- storage
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, timeout=5, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        old_umask = os.umask(0o077)  # auth.db and its WAL files are owner-only
         try:
-            server.bind(str(self._path))
+            with closing(self._connect()) as conn:
+                conn.executescript(SCHEMA)
         finally:
             os.umask(old_umask)
-        server.listen(8)
-        self._server = server
-        self._thread.start()
-        log.info("Live view ready (up to %g frames/s, %s quality, on demand)", self._max_fps(), self._live.quality)
+        os.chmod(self.path, 0o600)
 
-    def close(self) -> None:
-        self._closed.set()
-        if self._server is not None:
-            try:
-                self._server.close()
-            except OSError:
-                pass
-        self._path.unlink(missing_ok=True)
-        with self._lock:
-            self._stop_encoder()
+    def audit(self, conn: sqlite3.Connection, username: str | None, action: str, detail: str = "") -> None:
+        conn.execute("INSERT INTO audit_log (at, username, action, detail) VALUES (?, ?, ?, ?)",
+                     (int(time.time()), username, action, detail[:200]))
+        conn.execute("DELETE FROM audit_log WHERE id <= (SELECT MAX(id) FROM audit_log) - ?", (AUDIT_KEPT,))
 
-    # ------------------------------------------------------------- encoder
-    def _max_fps(self) -> float:
-        return min(self._live.max_fps, self._framerate)
+    def record(self, username: str | None, action: str, detail: str = "") -> None:
+        with closing(self._connect()) as conn:
+            self.audit(conn, username, action, detail)
 
-    def _start_encoder(self) -> bool:
-        if self._encoder is not None:
+    # ---------------------------------------------------------------- hashing
+    def _verify(self, password_hash: str, password: str) -> bool:
+        if not self._hash_slots.acquire(timeout=HASH_SLOT_WAIT_S):
+            raise AuthError("The camera is busy. Try again in a moment.")
+        try:
+            self._hasher.verify(password_hash, password)
             return True
-        skip = max(1, math.ceil(self._framerate / self._max_fps()))
-        try:
-            encoder = MJPEGEncoder()
-            encoder.frame_skip_count = skip
-            self._picam2.start_encoder(encoder, self._hub, name="lores",
-                                       quality=QUALITY_LEVELS[self._live.quality])
-            kind = "hardware"
-        except Exception as exc:  # noqa: BLE001 - fall back to software JPEG
-            log.warning("Hardware JPEG encoder unavailable (%s); using software JPEG", exc)
-            try:
-                encoder = JpegEncoder(num_threads=2, q=SOFTWARE_JPEG_QUALITY)
-                encoder.frame_skip_count = skip
-                self._picam2.start_encoder(encoder, self._hub, name="lores")
-                kind = "software"
-            except Exception as exc2:  # noqa: BLE001
-                log.error("Cannot start the live view encoder: %s", exc2)
-                return False
-        self._encoder = encoder
-        log.info("Live view started (%s JPEG, %.1f frames/s)", kind, self._framerate / skip)
-        return True
-
-    def _stop_encoder(self) -> None:
-        if self._encoder is None:
-            return
-        encoder, self._encoder = self._encoder, None
-        try:
-            self._picam2.stop_encoder(encoder)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("Error stopping the live view encoder: %s", exc)
-        log.info("Live view stopped (no viewers)")
-
-    # ------------------------------------------------------------- clients
-    def _accept_loop(self) -> None:
-        while not self._closed.is_set():
-            try:
-                conn, _ = self._server.accept()
-            except OSError:
-                return
-            threading.Thread(target=self._handle, args=(conn,), name="live-client", daemon=True).start()
-
-    def _handle(self, conn: socket.socket) -> None:
-        with conn:
-            conn.settimeout(CLIENT_TIMEOUT_S)
-            try:
-                command = conn.recv(COMMAND_MAX_BYTES).strip()
-                if command == b"SNAPSHOT":
-                    send_frame(conn, self._snapshot())
-                elif command == b"STREAM":
-                    self._stream(conn)
-            except (OSError, TimeoutError):
-                pass
-            except Exception:  # noqa: BLE001 - a viewer must never affect recording
-                log.exception("Live view client failed")
-
-    def _snapshot(self) -> bytes:
-        stream = self._picam2.stream_configuration("lores")
-        width, height = stream["size"]
-        buffer = self._picam2.capture_buffer("lores", wait=FRAME_WAIT_S)
-        return yuv420_to_jpeg(buffer, width, height, stream["stride"], SNAPSHOT_QUALITY)
-
-    def _stream(self, conn: socket.socket) -> None:
-        with self._lock:
-            if self._clients >= self._live.max_viewers:
-                return
-            if not self._start_encoder():
-                return
-            self._clients += 1
-        try:
-            sequence = 0
-            while not self._closed.is_set():
-                sequence, frame = self._hub.next_frame(sequence, FRAME_WAIT_S)
-                if frame is None:
-                    continue
-                send_frame(conn, frame)
+        except (VerifyMismatchError, VerificationError, InvalidHashError):
+            return False
         finally:
-            with self._lock:
-                self._clients -= 1
-                if self._clients == 0:
-                    self._stop_encoder()
+            self._hash_slots.release()
+
+    # ------------------------------------------------------------------ users
+    def user_count(self) -> int:
+        with closing(self._connect()) as conn:
+            return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+    def list_users(self) -> list[sqlite3.Row]:
+        with closing(self._connect()) as conn:
+            return conn.execute("SELECT u.id, u.username, u.created_at, u.password_changed_at,"
+                                " COALESCE(l.failed, 0) AS failed_logins, COALESCE(l.locked_until, 0) AS locked_until,"
+                                " (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id) AS sessions"
+                                " FROM users u LEFT JOIN lockouts l ON l.username = u.username"
+                                " ORDER BY u.username").fetchall()
+
+    def create_user(self, username: str, password: str) -> None:
+        username = normalize_username(username)
+        if not USERNAME_RE.match(username):
+            raise AuthError("Usernames are 3-32 characters: lowercase letters, digits, and . _ - (starting with a letter).")
+        problem = password_problem(password, username)
+        if problem:
+            raise AuthError(problem)
+        now = int(time.time())
+        with closing(self._connect()) as conn:
+            try:
+                conn.execute("INSERT INTO users (username, password_hash, created_at, password_changed_at)"
+                             " VALUES (?, ?, ?, ?)", (username, self._hasher.hash(password), now, now))
+            except sqlite3.IntegrityError:
+                raise AuthError(f"User {username} already exists.") from None
+            self.audit(conn, username, "user_created")
+
+    def set_password(self, username: str, password: str, actor: str = "cli") -> None:
+        username = normalize_username(username)
+        problem = password_problem(password, username)
+        if problem:
+            raise AuthError(problem)
+        with closing(self._connect()) as conn:
+            updated = conn.execute("UPDATE users SET password_hash = ?, password_changed_at = ? WHERE username = ?",
+                                   (self._hasher.hash(password), int(time.time()), username)).rowcount
+            if not updated:
+                raise AuthError(f"No user called {username}.")
+            conn.execute("DELETE FROM lockouts WHERE username = ?", (username,))
+            conn.execute("DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = ?)", (username,))
+            self.audit(conn, username, "password_changed", f"by {actor}; all sessions ended")
+
+    def unlock(self, username: str | None = None) -> None:
+        with closing(self._connect()) as conn:
+            if username:
+                conn.execute("DELETE FROM lockouts WHERE username = ?", (normalize_username(username),))
+            else:
+                conn.execute("DELETE FROM lockouts")
+            conn.execute("DELETE FROM login_failures")
+            self.audit(conn, username, "unlocked", "by cli")
+
+    # ------------------------------------------------------------------ login
+    def authenticate(self, username: str, password: str, user_agent: str) -> tuple[str | None, str | None]:
+        """Return (session_token, None) on success or (None, message for the user)."""
+        name = normalize_username(username)[:64]
+        password = password[:MAX_PASSWORD_LENGTH]
+        now = int(time.time())
+        with closing(self._connect()) as conn:
+            recent = conn.execute("SELECT COUNT(*) FROM login_failures WHERE at > ?",
+                                  (now - GLOBAL_WINDOW_S,)).fetchone()[0]
+            if recent >= GLOBAL_MAX_FAILURES:
+                self.audit(conn, safe_label(name), "login_blocked", "too many failures on all accounts")
+                return None, "Too many failed logins recently. Try again in a few minutes."
+            lock = conn.execute("SELECT * FROM lockouts WHERE username = ?", (name,)).fetchone()
+            if lock and lock["locked_until"] > now:
+                minutes = max(1, round((lock["locked_until"] - now) / 60))
+                self.audit(conn, safe_label(name), "login_blocked", "username locked")
+                return None, f"Too many failed attempts. Try again in about {minutes} minute(s)."
+            user = conn.execute("SELECT * FROM users WHERE username = ?", (name,)).fetchone()
+
+        try:
+            ok = self._verify(user["password_hash"] if user else self._dummy_hash, password) and user is not None
+        except AuthError as exc:
+            return None, str(exc)
+
+        with closing(self._connect()) as conn:
+            if not ok:
+                conn.execute("INSERT INTO login_failures (at) VALUES (?)", (now,))
+                conn.execute("DELETE FROM login_failures WHERE at <= ?", (now - GLOBAL_WINDOW_S,))
+                failed = (lock["failed"] if lock else 0) + 1
+                locked_until = 0
+                if failed >= self._lock_threshold:
+                    locked_until = now + min(LOCK_MAX_S, LOCK_BASE_S * 2 ** (failed - self._lock_threshold))
+                conn.execute("INSERT INTO lockouts (username, failed, locked_until, updated_at) VALUES (?, ?, ?, ?)"
+                             " ON CONFLICT(username) DO UPDATE SET failed = excluded.failed,"
+                             " locked_until = excluded.locked_until, updated_at = excluded.updated_at",
+                             (name, failed, locked_until, now))
+                conn.execute("DELETE FROM lockouts WHERE updated_at < ? AND locked_until < ?",
+                             (now - LOCKOUT_FORGET_S, now))
+                self.audit(conn, safe_label(name), "login_failed")
+                log.warning("Failed login for %r", safe_label(name))
+                return None, "Wrong username or password."
+
+            conn.execute("DELETE FROM lockouts WHERE username = ?", (name,))
+            if self._hasher.check_needs_rehash(user["password_hash"]):
+                conn.execute("UPDATE users SET password_hash = ? WHERE id = ?",
+                             (self._hasher.hash(password), user["id"]))
+            token = self._new_session(conn, user["id"], user_agent)
+            self.audit(conn, name, "login")
+            log.info("User %s logged in", name)
+            return token, None
+
+    def _new_session(self, conn: sqlite3.Connection, user_id: int, user_agent: str) -> str:
+        token = secrets.token_urlsafe(TOKEN_BYTES)
+        now = int(time.time())
+        conn.execute("INSERT INTO sessions (token_hash, user_id, csrf_token, created_at, last_seen, reauth_at,"
+                     " user_agent) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     (hash_token(token), user_id, secrets.token_urlsafe(TOKEN_BYTES), now, now, now,
+                      user_agent[:200]))
+        conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash NOT IN (SELECT token_hash FROM sessions"
+                     " WHERE user_id = ? ORDER BY created_at DESC LIMIT ?)", (user_id, user_id, MAX_SESSIONS_PER_USER))
+        return token
+
+    # --------------------------------------------------------------- sessions
+    def get_session(self, token: str) -> dict | None:
+        if not token or len(token) > 100:
+            return None
+        now = int(time.time())
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT s.*, u.username FROM sessions s JOIN users u ON u.id = s.user_id"
+                               " WHERE s.token_hash = ?", (hash_token(token),)).fetchone()
+            if row is None:
+                return None
+            if now - row["last_seen"] > self._idle_s or now - row["created_at"] > self._max_age_s:
+                conn.execute("DELETE FROM sessions WHERE token_hash = ?", (row["token_hash"],))
+                return None
+            if now - row["last_seen"] >= SEEN_UPDATE_S:
+                conn.execute("UPDATE sessions SET last_seen = ? WHERE token_hash = ?", (now, row["token_hash"]))
+            return dict(row)
+
+    def logout(self, session: dict) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute("DELETE FROM sessions WHERE token_hash = ?", (session["token_hash"],))
+            self.audit(conn, session["username"], "logout")
+
+    def logout_others(self, session: dict) -> int:
+        with closing(self._connect()) as conn:
+            ended = conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?",
+                                 (session["user_id"], session["token_hash"])).rowcount
+            self.audit(conn, session["username"], "logout_others", f"{ended} session(s) ended")
+            return ended
+
+    def logout_all(self, username: str) -> int:
+        with closing(self._connect()) as conn:
+            ended = conn.execute("DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = ?)",
+                                 (normalize_username(username),)).rowcount
+            self.audit(conn, normalize_username(username), "logout_all", f"by cli; {ended} session(s) ended")
+            return ended
+
+    def sessions_for(self, user_id: int) -> list[sqlite3.Row]:
+        with closing(self._connect()) as conn:
+            return conn.execute("SELECT token_hash, created_at, last_seen, user_agent FROM sessions"
+                                " WHERE user_id = ? ORDER BY last_seen DESC", (user_id,)).fetchall()
+
+    def change_password(self, session: dict, current: str, new: str) -> None:
+        with closing(self._connect()) as conn:
+            user = conn.execute("SELECT * FROM users WHERE id = ?", (session["user_id"],)).fetchone()
+        if not self._verify(user["password_hash"], current[:MAX_PASSWORD_LENGTH]):
+            self.record(user["username"], "password_change_failed", "wrong current password")
+            raise AuthError("The current password is wrong.")
+        problem = password_problem(new, user["username"])
+        if problem:
+            raise AuthError(problem)
+        with closing(self._connect()) as conn:
+            conn.execute("UPDATE users SET password_hash = ?, password_changed_at = ? WHERE id = ?",
+                         (self._hasher.hash(new), int(time.time()), user["id"]))
+            conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?",
+                         (user["id"], session["token_hash"]))
+            self.audit(conn, user["username"], "password_changed", "by web; other sessions ended")
+
+    def recent_audit(self, limit: int = 20) -> list[sqlite3.Row]:
+        with closing(self._connect()) as conn:
+            return conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 EOF
 ```
 
-**3. New file `app/web_live.py`** (the web side):
+**3. New file `app/web_auth.py`:**
 
 ```bash
-cat > ~/surveillance/app/web_live.py <<'EOF'
-"""Live view in the browser (Phase 10).
+cat > ~/surveillance/app/web_auth.py <<'EOF'
+"""Login, logout, account page and the checks that protect every other page (Phase 11).
 
-Relays JPEG frames from the recorder's Unix socket to the browser as MJPEG
-(multipart/x-mixed-replace), which every browser shows in a plain <img> element.
-The recorder only encodes while at least one viewer is connected.
+Every request except the login page and static files needs a valid session:
+  * pages redirect to /login; API, video, download and live endpoints answer 401
+  * every POST must come from this site (Origin/Referer check) and carry the session's
+    CSRF token, so another website cannot make your browser perform actions here
+  * the session cookie is HttpOnly (invisible to JavaScript), Secure, SameSite=Strict and
+    uses the __Host- prefix, so it is never sent to other sites or sub-domains
 """
 from __future__ import annotations
 
-import socket
-import struct
-import threading
+import hmac
+import logging
+from datetime import datetime
+from urllib.parse import urlsplit
 
-from flask import Blueprint, Response, abort, render_template
+from flask import Blueprint, abort, g, redirect, render_template, request, url_for
 
+from app.auth import AUTH_DB_NAME, AuthError, AuthStore
 from app.config import Settings
 
-SOCKET_NAME = "live.sock"
-CONNECT_TIMEOUT_S = 3.0
-READ_TIMEOUT_S = 10.0
-MAX_FRAME_BYTES = 4 * 1024 * 1024
-BOUNDARY = "frame"
+log = logging.getLogger("Auth")
+
+COOKIE_NAME = "__Host-sid"
+PUBLIC_ENDPOINTS = {"auth.login", "auth.login_post", "static"}
+RESOURCE_ENDPOINTS = {"api_status", "live.stream", "live.snapshot", "rec.video", "rec.download"}
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+MESSAGES = {
+    "password_changed": "Password changed. All your other sessions were logged out.",
+    "others_logged_out": "All other sessions were logged out.",
+    "logged_out": "You have been logged out.",
+    "expired": "Please log in.",
+}
 
 
-def _read_exact(conn: socket.socket, size: int) -> bytes:
-    chunks, remaining = [], size
-    while remaining:
-        chunk = conn.recv(min(remaining, 65536))
-        if not chunk:
-            raise ConnectionError("recorder closed the live stream")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
+def safe_next(target: str | None) -> str:
+    """Only allow redirects to paths on this site (never //other.example or https://...)."""
+    if not target or not target.startswith("/") or target.startswith("//") or "\\" in target:
+        return url_for("dashboard")
+    return target
 
 
-def _read_frame(conn: socket.socket) -> bytes:
-    (length,) = struct.unpack(">I", _read_exact(conn, 4))
-    if not 0 < length <= MAX_FRAME_BYTES:
-        raise ConnectionError(f"invalid frame length {length}")
-    return _read_exact(conn, length)
+def same_origin() -> bool:
+    for header in ("Origin", "Referer"):
+        value = request.headers.get(header)
+        if value:
+            return value != "null" and urlsplit(value).netloc == request.host
+    return False
 
 
-class _MjpegStream:
-    """Response body. close() is always called by the WSGI server, even if the client
-    disconnects before the first frame, so the viewer slot and socket are never leaked."""
+def install(app, settings: Settings) -> AuthStore:
+    auth = settings.auth
+    store = AuthStore(settings.database_dir / AUTH_DB_NAME, auth.idle_timeout_minutes,
+                      auth.session_max_hours, auth.lockout_threshold)
+    store.init()
+    bp = Blueprint("auth", __name__)
 
-    def __init__(self, conn: socket.socket, release) -> None:
-        self._conn = conn
-        self._release = release
-        self._closed = False
+    @app.before_request
+    def require_login():
+        g.session = None
+        token = request.cookies.get(COOKIE_NAME)
+        if token:
+            g.session = store.get_session(token)
+        if request.method not in SAFE_METHODS and not same_origin():
+            abort(403)
+        if request.endpoint in PUBLIC_ENDPOINTS:
+            return None
+        if g.session is None:
+            if request.endpoint in RESOURCE_ENDPOINTS or request.endpoint is None:
+                abort(401)
+            return redirect(url_for("auth.login", next=request.full_path.rstrip("?"), msg="expired"))
+        if request.method not in SAFE_METHODS:
+            sent = request.form.get("csrf_token") or request.headers.get("X-CSRF-Token", "")
+            if not hmac.compare_digest(sent, g.session["csrf_token"]):
+                abort(403)
+        return None
 
-    def __iter__(self):
-        try:
-            while True:
-                frame = _read_frame(self._conn)
-                yield (f"--{BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {len(frame)}\r\n\r\n"
-                       .encode() + frame + b"\r\n")
-        except (OSError, ConnectionError, struct.error):
-            return
-        finally:
-            self.close()
+    @app.context_processor
+    def auth_context() -> dict:
+        session = getattr(g, "session", None)
+        return {"current_user": session["username"] if session else None,
+                "csrf_token": session["csrf_token"] if session else ""}
 
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._conn.close()
-        self._release()
+    @app.errorhandler(401)
+    def unauthorized(_error):
+        return "Login required", 401
 
+    @app.errorhandler(403)
+    def forbidden(_error):
+        return render_template("placeholder.html", title="Forbidden", page="", phase=None,
+                               text="This request was refused (it did not come from this page, or the form "
+                                    "expired). Go back, reload the page and try again."), 403
 
-def create_blueprint(settings: Settings) -> Blueprint:
-    bp = Blueprint("live", __name__)
-    socket_path = str(settings.runtime_dir / SOCKET_NAME)
-    viewers = threading.BoundedSemaphore(settings.live.max_viewers)
-
-    def connect(command: bytes) -> socket.socket:
-        if not settings.live.enabled:
-            abort(404)
-        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        conn.settimeout(CONNECT_TIMEOUT_S)
-        try:
-            conn.connect(socket_path)
-            conn.sendall(command + b"\n")
-        except OSError:
-            conn.close()
-            abort(503)
-        conn.settimeout(READ_TIMEOUT_S)
-        return conn
-
-    @bp.get("/live")
-    def live_page():
-        return render_template("live.html", title="Live View", page="live.live_page", live=settings.live)
-
-    @bp.get("/live/snapshot.jpg")
-    def snapshot():
-        conn = connect(b"SNAPSHOT")
-        try:
-            frame = _read_frame(conn)
-        except (OSError, ConnectionError, struct.error):
-            abort(503)
-        finally:
-            conn.close()
-        return Response(frame, mimetype="image/jpeg")
-
-    @bp.get("/live/stream")
-    def stream():
-        if not viewers.acquire(blocking=False):
-            abort(503)
-        try:
-            conn = connect(b"STREAM")
-        except Exception:
-            viewers.release()
-            raise
-        response = Response(_MjpegStream(conn, viewers.release),
-                            mimetype=f"multipart/x-mixed-replace; boundary={BOUNDARY}")
-        response.headers["X-Accel-Buffering"] = "no"
+    def set_session_cookie(response, token: str):
+        response.set_cookie(COOKIE_NAME, token, httponly=True, secure=True, samesite="Strict", path="/")
         return response
 
-    return bp
+    @bp.get("/login")
+    def login():
+        if g.session:
+            return redirect(safe_next(request.args.get("next")))
+        return render_template("login.html", title="Log in", page="", next=request.args.get("next", ""),
+                               error=None, username="", message=MESSAGES.get(request.args.get("msg", "")),
+                               no_users=store.user_count() == 0)
+
+    @bp.post("/login")
+    def login_post():
+        username = request.form.get("username", "")[:64]
+        password = request.form.get("password", "")
+        target = request.form.get("next", "")
+        token, error = store.authenticate(username, password, request.headers.get("User-Agent", ""))
+        if error:
+            return render_template("login.html", title="Log in", page="", next=target, error=error,
+                                   username=username, message=None, no_users=store.user_count() == 0), 401
+        return set_session_cookie(redirect(safe_next(target)), token)
+
+    @bp.post("/logout")
+    def logout():
+        store.logout(g.session)
+        response = redirect(url_for("auth.login", msg="logged_out"))
+        response.delete_cookie(COOKIE_NAME, path="/", secure=True, httponly=True, samesite="Strict")
+        return response
+
+    @bp.get("/account")
+    def account():
+        sessions = [{"current": s["token_hash"] == g.session["token_hash"],
+                     "created": datetime.fromtimestamp(s["created_at"]),
+                     "last_seen": datetime.fromtimestamp(s["last_seen"]),
+                     "agent": (s["user_agent"] or "unknown browser")[:80]}
+                    for s in store.sessions_for(g.session["user_id"])]
+        audit = [{"at": datetime.fromtimestamp(a["at"]), "username": a["username"] or "",
+                  "action": a["action"].replace("_", " "), "detail": a["detail"] or ""}
+                 for a in store.recent_audit(25)]
+        return render_template("account.html", title="Account", page="auth.account", sessions=sessions,
+                               audit=audit, error=None, message=MESSAGES.get(request.args.get("msg", "")))
+
+    @bp.post("/account/password")
+    def change_password():
+        new, confirm = request.form.get("new_password", ""), request.form.get("confirm_password", "")
+        try:
+            if new != confirm:
+                raise AuthError("The two new passwords do not match.")
+            store.change_password(g.session, request.form.get("current_password", ""), new)
+        except AuthError as exc:
+            return render_template("account.html", title="Account", page="auth.account", sessions=[], audit=[],
+                                   error=str(exc), message=None), 400
+        return redirect(url_for("auth.account", msg="password_changed"))
+
+    @bp.post("/account/logout-others")
+    def logout_others():
+        store.logout_others(g.session)
+        return redirect(url_for("auth.account", msg="others_logged_out"))
+
+    app.register_blueprint(bp)
+    return store
 EOF
 ```
 
-**4. The Live View page and its script:**
+**4. New templates, `login.html` and `account.html`:**
 
 ```bash
-cat > ~/surveillance/web/templates/live.html <<'EOF'
+cat > ~/surveillance/web/templates/login.html <<'EOF'
 {% extends "base.html" %}
-{% block scripts %}<script src="{{ url_for('static', filename='live.js') }}" defer></script>{% endblock %}
 {% block content %}
-<section class="panel">
-  {% if live.enabled %}
-  <div class="live-frame" id="live-frame" data-max-minutes="{{ live.max_view_minutes }}">
-    <img id="live-image" alt="Live camera view">
-    <div class="live-overlay" id="live-overlay">
-      <span id="live-message">Connecting…</span>
-      <button class="button primary" id="live-resume" type="button" hidden>Resume live view</button>
-    </div>
-    <span class="live-badge" id="live-badge" hidden>● LIVE</span>
-  </div>
-  <div class="player-actions">
-    <button class="button" type="button" id="live-toggle">Pause</button>
-    <button class="button" type="button" id="live-fullscreen">Full screen</button>
-    <span class="muted">Up to {{ live.max_fps|round|int }} frames per second from the low-resolution stream.
-      Pauses when this tab is hidden and after {{ live.max_view_minutes }} minutes, so the camera only
-      encodes while someone is watching.</span>
-  </div>
-  {% else %}
-  <p class="muted">Live view is turned off (<code>live.enabled</code> is false).</p>
+<section class="panel login-panel">
+  <h2>Log in</h2>
+  {% if message %}<p class="notice">{{ message }}</p>{% endif %}
+  {% if no_users %}
+  <p class="notice">No account exists yet. Create one on the Raspberry Pi (over SSH):<br>
+    <code>cd ~/surveillance &amp;&amp; python3 tools/manage_users.py create admin</code></p>
   {% endif %}
+  <form method="post" action="{{ url_for('auth.login_post') }}" class="stack">
+    <input type="hidden" name="next" value="{{ next }}">
+    <label>Username
+      <input type="text" name="username" value="{{ username }}" autocomplete="username" autocapitalize="none"
+             spellcheck="false" maxlength="64" required autofocus>
+    </label>
+    <label>Password
+      <input type="password" name="password" autocomplete="current-password" maxlength="256" required>
+    </label>
+    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+    <button class="button primary" type="submit">Log in</button>
+  </form>
 </section>
 {% endblock %}
 EOF
 
-cat > ~/surveillance/web/static/live.js <<'EOF'
-"use strict";
+cat > ~/surveillance/web/templates/account.html <<'EOF'
+{% extends "base.html" %}
+{% block content %}
+{% if message %}<p class="notice">{{ message }}</p>{% endif %}
 
-// Live MJPEG view. The stream is closed whenever it is not being watched (tab hidden, paused,
-// or after max_view_minutes), and the recorder stops encoding once no viewer is connected.
-(() => {
-  const img = document.getElementById("live-image");
-  if (!img) return;
-  const frame = document.getElementById("live-frame");
-  const overlay = document.getElementById("live-overlay");
-  const message = document.getElementById("live-message");
-  const resume = document.getElementById("live-resume");
-  const badge = document.getElementById("live-badge");
-  const toggle = document.getElementById("live-toggle");
-  const fullscreen = document.getElementById("live-fullscreen");
-  const maxMs = Number(frame.dataset.maxMinutes || 10) * 60000;
+<section class="panel">
+  <h2>Change password</h2>
+  <form method="post" action="{{ url_for('auth.change_password') }}" class="stack narrow">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>Current password <input type="password" name="current_password" autocomplete="current-password" maxlength="256" required></label>
+    <label>New password (at least 15 characters) <input type="password" name="new_password" autocomplete="new-password" minlength="15" maxlength="256" required></label>
+    <label>Repeat new password <input type="password" name="confirm_password" autocomplete="new-password" minlength="15" maxlength="256" required></label>
+    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+    <button class="button primary" type="submit">Change password</button>
+  </form>
+  <p class="muted">A long passphrase from a password manager is best. Changing it logs out every other session.</p>
+</section>
 
-  let running = false;
-  let pausedByUser = false;
-  let retryTimer = null;
-  let stopTimer = null;
+{% if sessions %}
+<section class="panel">
+  <h2>Active sessions</h2>
+  <div class="table-wrap">
+    <table class="list">
+      <thead><tr><th>Browser</th><th>Logged in</th><th>Last active</th><th></th></tr></thead>
+      <tbody>
+      {% for s in sessions %}
+        <tr><td>{{ s.agent }}</td><td>{{ s.created.strftime('%Y-%m-%d %H:%M') }}</td>
+          <td>{{ s.last_seen.strftime('%Y-%m-%d %H:%M') }}</td>
+          <td>{% if s.current %}<span class="badge motion">this browser</span>{% endif %}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <form method="post" action="{{ url_for('auth.logout_others') }}" class="player-actions">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="button" type="submit">Log out all other sessions</button>
+  </form>
+</section>
+{% endif %}
 
-  function show(text, offerResume) {
-    overlay.hidden = false;
-    message.textContent = text;
-    resume.hidden = !offerResume;
-    badge.hidden = true;
-  }
+{% if audit %}
+<section class="panel">
+  <h2>Security log (latest 25)</h2>
+  <div class="table-wrap">
+    <table class="list">
+      <thead><tr><th>Time</th><th>User</th><th>Event</th><th>Detail</th></tr></thead>
+      <tbody>
+      {% for a in audit %}
+        <tr><td>{{ a.at.strftime('%Y-%m-%d %H:%M:%S') }}</td><td>{{ a.username }}</td>
+          <td>{{ a.action }}</td><td>{{ a.detail }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+{% endblock %}
+EOF
+```
 
-  function start() {
-    clearTimeout(retryTimer);
-    clearTimeout(stopTimer);
-    running = true;
-    show("Connecting…", false);
-    img.src = `/live/stream?ts=${Date.now()}`;
-    stopTimer = setTimeout(() => stop("Live view paused to save bandwidth.", true), maxMs);
-    toggle.textContent = "Pause";
-  }
+**5. New tool `tools/manage_users.py`:**
 
-  function stop(text, offerResume) {
-    running = false;
-    clearTimeout(retryTimer);
-    clearTimeout(stopTimer);
-    img.src = "data:,";   // closes the stream connection
-    show(text, offerResume);
-    toggle.textContent = "Resume";
-  }
+```bash
+cat > ~/surveillance/tools/manage_users.py <<'EOF'
+#!/usr/bin/env python3
+"""Manage web accounts (run on the Pi over SSH; there is deliberately no web sign-up page).
 
-  img.addEventListener("load", () => {
-    if (!running) return;
-    overlay.hidden = true;
-    badge.hidden = false;
-  });
-  img.addEventListener("error", () => {
-    if (!running) return;
-    show("Camera not reachable (recorder stopped, or too many viewers). Retrying…", false);
-    retryTimer = setTimeout(start, 3000);
-  });
+    python3 ~/surveillance/tools/manage_users.py create admin     # asks for the password twice
+    python3 ~/surveillance/tools/manage_users.py passwd admin     # set a new password, ends all sessions
+    python3 ~/surveillance/tools/manage_users.py list
+    python3 ~/surveillance/tools/manage_users.py unlock [admin]   # clear failed-login lockouts
+    python3 ~/surveillance/tools/manage_users.py logout admin     # end every session of the user
+    python3 ~/surveillance/tools/manage_users.py log              # recent security events
+"""
+from __future__ import annotations
 
-  resume.addEventListener("click", () => { pausedByUser = false; start(); });
-  toggle.addEventListener("click", () => {
-    if (running) { pausedByUser = true; stop("Paused.", true); } else { pausedByUser = false; start(); }
-  });
-  fullscreen.addEventListener("click", () => {
-    if (document.fullscreenElement) document.exitFullscreen();
-    else if (frame.requestFullscreen) frame.requestFullscreen();
-  });
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) {
-      if (running) stop("Paused while the tab was hidden.", true);
-    } else if (!pausedByUser) {
-      start();
-    }
-  });
+import argparse
+import getpass
+import sys
+from datetime import datetime
+from pathlib import Path
 
-  start();
-})();
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from app.auth import AUTH_DB_NAME, AuthError, AuthStore  # noqa: E402
+from app.config import DEFAULT_CONFIG_PATH, ConfigError, load_settings  # noqa: E402
+
+
+def ask_password(username: str) -> str:
+    print("Choose a password of at least 15 characters. A passphrase of 4-5 random words works well;")
+    print("a password manager can generate and remember one for you.")
+    first = getpass.getpass(f"New password for {username}: ")
+    second = getpass.getpass("Repeat it: ")
+    if first != second:
+        raise AuthError("The two passwords do not match.")
+    return first
+
+
+def when(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M") if epoch else "-"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Manage surveillance web accounts")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("create", "passwd", "logout"):
+        sub.add_parser(name).add_argument("username")
+    sub.add_parser("unlock").add_argument("username", nargs="?")
+    sub.add_parser("list")
+    sub.add_parser("log")
+    args = parser.parse_args()
+
+    try:
+        settings, _ = load_settings(args.config, create_if_missing=False)
+    except ConfigError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
+    auth = settings.auth
+    store = AuthStore(settings.database_dir / AUTH_DB_NAME, auth.idle_timeout_minutes,
+                      auth.session_max_hours, auth.lockout_threshold)
+    store.init()
+
+    try:
+        if args.command == "create":
+            store.create_user(args.username, ask_password(args.username.lower()))
+            print(f"User {args.username.lower()} created. Log in at http://localhost:8080/login")
+        elif args.command == "passwd":
+            store.set_password(args.username, ask_password(args.username.lower()))
+            print("Password changed; every session of this user was logged out.")
+        elif args.command == "logout":
+            print(f"{store.logout_all(args.username)} session(s) ended.")
+        elif args.command == "unlock":
+            store.unlock(args.username)
+            print("Lockouts cleared.")
+        elif args.command == "list":
+            users = store.list_users()
+            if not users:
+                print("No users yet. Create one with: python3 tools/manage_users.py create admin")
+            for u in users:
+                locked = " LOCKED until " + when(u["locked_until"]) if u["locked_until"] > datetime.now().timestamp() else ""
+                print(f"{u['username']:<20} created {when(u['created_at'])}  password changed "
+                      f"{when(u['password_changed_at'])}  sessions {u['sessions']}  failed logins "
+                      f"{u['failed_logins']}{locked}")
+        elif args.command == "log":
+            for a in reversed(store.recent_audit(50)):
+                print(f"{when(a['at'])}  {a['username'] or '-':<20} {a['action']:<24} {a['detail'] or ''}")
+    except AuthError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 EOF
 ```
 
 ## Test procedure
 
-**0. Start both programs again:** `python3 -m app.main` in window 1 and `python3 -m app.web_main` in window 2. Keep the laptop tunnel open. Window 1 should show `LiveStream: Live view ready (up to 8 frames/s, medium quality, on demand)`.
-
-**1. Dashboard:** it should now show the latest camera image in real colour, refreshing about every 10 s. Click it.
-
-**2. Live View:**
-- Within a second or two you should see the **● LIVE** badge, and window 1 should show:
-  - `Live view started (hardware JPEG, 7.5 frames/s)`
-- **Check the delay:** wave at the camera and watch the screen. It should show up in well under a second.
-- Click **Pause**. Window 1 should show `Live view stopped (no viewers)`. Click **Resume** and it starts again.
-- **Switch to another browser tab for a few seconds.** The stream should stop (the same log line appears) and restart when you come back.
-- Try **Full screen**.
-
-**3. Viewer limit:** open the Live View in **4 tabs**. The 4th should show "Camera not reachable (… too many viewers). Retrying…". Close them all afterwards. As soon as the last one closes, the log should show `Live view stopped`.
-
-**4. Recording is unaffected.** Set 60-second segments and restart the recorder:
+**1. Create your account on the Pi.** The password won't be shown as you type:
 
 ```bash
-python3 tools/set_setting.py recording.segment_seconds 60
+cd ~/surveillance
+python3 tools/manage_users.py create admin
+python3 tools/manage_users.py list
+ls -l database/auth.db          # must show -rw------- (only you can read it)
 ```
 
-Keep the Live View open for about 3 minutes, then check the segments recorded meanwhile:
+**2. Restart the web interface** (Ctrl+C in window 2, then `python3 -m app.web_main`). The recorder can keep running. Use **Chrome, Edge or Firefox** on the laptop, through the tunnel as before.
+
+**3. In the browser:**
+- Open **http://localhost:8080**. You should land on the **Log in** page, with no navigation bar.
+- Log in with a **wrong** password. Expect "Wrong username or password."
+- Log in correctly. Every page works as before. **Live View** and playing a recording should work too, since they're protected by the same session.
+- Your username and **Log out** appear on the right of the navigation bar.
+
+**4. Account page** (click your username):
+- **Change password.** First enter a wrong current password (it should be refused), then do it properly.
+- **Sessions:** log in from a second browser or a private window, check it appears under **Active sessions**, then use **Log out all other sessions**. The other browser should land on the login page at its next click, or within about 5 s on the dashboard.
+
+**5. Lockout.**
+1. Log out, then enter a wrong password **6 times**. From the 6th attempt you'll see "Too many failed attempts".
+2. Check that it's locked, then unlock it:
+   ```bash
+   python3 tools/manage_users.py list      # shows LOCKED until …
+   python3 tools/manage_users.py unlock admin
+   ```
+3. Log in normally.
+
+**6. Security checks, on the Pi, while logged out:**
 
 ```bash
-python3 tools/phase4_check_segments.py --last 3
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/api/status            # 401
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/live/stream           # 401
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/recordings/1/video    # 401
+curl -s -o /dev/null -w "%{http_code}\n" -X POST -H "Origin: https://evil.example" http://127.0.0.1:8080/login   # 403
+python3 tools/manage_users.py log | tail -10
 ```
-
-Every segment should be `[PASS]` with no timestamp gaps. Afterwards, set it back with `python3 tools/set_setting.py recording.segment_seconds 300` and restart the recorder.
-
-**5. CPU while watching.** With the Live View open, run:
-
-```bash
-top -b -n 2 -d 60 -p "$(pgrep -f '^python3 -m app.main')" | grep python3
-```
-
-The second line is the 60-second average; compare it with the 21.8 % you measured before. I expect roughly **+3–8 %** with the hardware encoder.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| Window 1 shows `Hardware JPEG encoder unavailable … using software JPEG` | Live view still works, but uses more CPU. Send me the full line. |
-| The picture is green, purple or striped | Send me a screenshot. Colour-data layout is the one thing my fake camera couldn't check. |
-| It stays on "Connecting…" | Check window 1 for `Live view ready`, and that both programs run as `ysak`. Then run `ls -l /run/user/$(id -u)/surveillance/`, which should list `live.sock`. |
-| The live picture freezes but recording carries on | Send me the last lines of `logs/surveillance.log` and `logs/web.log`. |
+| Logging in just shows the login page again, with no error | The browser refused the secure cookie; this is the case in Safari. Use Chrome, Edge or Firefox through the tunnel. |
+| "This request was refused" | You submitted a form from a page opened before restarting the web interface, or from another site. Reload the page and try again. |
+| You locked yourself out | Run `python3 tools/manage_users.py unlock` on the Pi. |
+| You forgot your password | Run `python3 tools/manage_users.py passwd admin` on the Pi. |
+| `ModuleNotFoundError: argon2` | `sudo apt install -y python3-argon2` |
 
 **Please send me:**
-- a screenshot of the Live View;
-- the `Live view started (…)` log line;
-- the checker result from step 4;
-- the CPU figure from step 5.
+- whether login, logout, the password change and the lockout behaved as described;
+- the output of step 6;
+- a screenshot of the Account page, if you like.
 
-Phase 11 then adds **authentication**:
-- an admin account created from the command line, with an Argon2id-hashed password;
-- secure sessions, CSRF protection and brute-force lockout;
-- re-entering your password for sensitive actions;
-- the Settings page becoming editable.
+Next is **Phase 11b**, the editable Settings page:
+- every setting validated;
+- dangerous changes (for example the storage limit or the recordings folder) require re-entering your password;
+- the recorder picks up changes automatically;
+- the optional `camera.tuning_file` for your NoIR camera's colours.
+
+After that, Phase 12 sets up Tailscale for private remote access.
