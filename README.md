@@ -1,558 +1,641 @@
-Phase 6 (motion detection) is ready to run on your Pi. Phase 5 passed, apart from one "critical storage" retest you need to do first because of a number I gave you. I tested Phase 6 here with synthetic scenes and the fake camera, not on your hardware.
+Phase 7 (the SQLite database) is ready for you to run on the Pi. It passed all my tests here with the fake camera but hasn't run on real hardware yet.
 
-## Phase 5 results
+## Phase 6 results
 
-- **Test A (crash recovery):** passed. The unfinished file became `15-27-00Z.recovered.mp4` with 23.9 s playable, after cutting 204 KiB of half-written data.
-- **Test B (size limit):** passed. Deletions went oldest first, and the file being written was never touched.
-  - The checker's `+142.4 s unaccounted for` WARN is a checker mistake, not lost footage. You restarted at 15:30:59, the first frame arrived just after 15:31:00, so the new segment looked like a normal aligned one and the checker missed the restart. It now treats any gap over 10 s as a restart.
-  - The report's 1.09 Mbit/s estimate counted a segment stopped after 37.6 s as a full minute. It now uses only complete one-minute segments.
-- **Test C (free space):** the "low" part passed. The "critical" part **wasn't actually tested**, because of my instructions. The pause happens below half of `min_free_gb`; half of 100 is 50.0 GB and you had 50.23 GB free. My rule of "above 2 × free" meant above 100.46, and 100 was just under that. The retest with 120 is step 0 below.
-- **Test D (unmounted SSD):** passed. It refused to record, retried, and created nothing on the SD card.
-- **Test E** (restoring the normal settings) is still to do; it's part of step 0 below.
+- **Emergency storage pause:** confirmed on the Pi. You got `Storage critical … PAUSED`, then `Recording paused`, and no new segments.
+- **Motion detection:** works. Events are logged and segments are marked `motion=yes` or `motion=no`.
+- **Motion right after start:** in both runs, motion started 2–4 s after launch. If you weren't moving in front of the camera, that was auto-exposure still adjusting. In step 0 it also ran for 80.8 s with a 57.4 % peak, which is more likely you in front of the camera; the settle change won't affect that. The detector now waits **3 s** after start instead of 1 s (included in this update).
+- **CPU:** 12.4 % and 24 % of one core in two 5-second samples. That's too short to judge, so step 6 below measures a 60-second average.
+- **Memory:** 190 MB, in line with my estimate.
 
-## What Phase 6 adds
+## What Phase 7 adds
 
-**How detection works:**
-1. The detector reads the 640×480 greyscale channel from the camera's low-resolution stream and halves it to 320×240.
-2. It does this about 5 times per second, while the full-quality recording carries on untouched.
-3. Each frame is blurred to remove sensor noise and compared with a slowly updating picture of the empty scene, called the background.
-4. It then finds the **largest connected patch of changed pixels**.
+**The database index.** `database/surveillance.db` is an index of every recording and motion event. The files on disk remain the source of truth; the database makes browsing, searching and the timeline fast. The web app in Phase 8 will read it.
 
-Using the largest single patch rather than the total number of changed pixels means scattered noise can't add up to a false trigger.
+| Table | Contents |
+|---|---|
+| `cameras` | Camera ID and name (renaming the camera later keeps all recordings attached to it) |
+| `recordings` | File path, start, end, duration, size, frames, `complete` or `recovered`, motion flag, clock-synced flag |
+| `motion_events` | Start, end, duration, peak area |
+| `motion_event_recordings` | Links between events and recordings. An event that crosses a segment boundary is linked to both files |
+| `v_motion_events` | A ready-made view in your original sketch's layout: one row per event with its `recording_file` |
 
-**Settings** (in the new `motion` section):
+All times are stored as UTC milliseconds. Phase 8 converts them to your local time.
 
-| Setting | Default | Meaning |
-|---|---|---|
-| `sensitivity` | 70 | 1–100. Higher means a smaller brightness change counts. 70 means a change of 28 out of 255. |
-| `min_area_percent` | 0.5 | The patch must cover this much of the frame, about 20×20 pixels. |
-| `trigger_frames` | 3 | Movement must be seen in 3 analysed frames in a row (about 0.6 s). Single-frame flickers are ignored. |
-| `cooldown_seconds` | 10 | An event ends only after 10 s with no movement, so one continuous movement is one event. |
-| `analysis_fps` | 5 | Frames analysed per second. |
-| `enabled` | true | Turns motion detection on or off. |
+**Safety:**
+- **No waiting on the database.** One background writer thread does all database writes, so the camera, encoder and motion threads never wait for it. If a database error happens, it's logged and **recording carries on**.
+- **Durable writes.** SQLite's WAL mode with `synchronous=FULL` means a saved change survives a power cut.
+- **At every start:**
+  - an integrity check runs;
+  - a damaged file is moved aside as `surveillance.db.corrupt-<time>` and the newest good backup is restored;
+  - motion events left open by a crash are closed;
+  - the index is **reconciled against the recordings folder**: files without a row are added, and rows whose file is gone are removed.
+- **Daily backup** to `database/backups/`, keeping the last 3.
+- **Old events:** events whose footage has been deleted are kept for 90 days (`motion.keep_events_days`).
 
-**Other behaviour:**
-- **Lighting changes:** if more than 60 % of the frame changes at once (lights switched on, exposure jumps), the background is relearned instead of reporting motion.
-- **Selective learning:** pixels that are currently changing are learned at half speed. A walking person doesn't leave a "ghost trail" that stretches the event. Someone who stops and stands still becomes part of the background after about 15 s.
-- **Logs:** `Motion started (area 3.3% of the frame)` and `Motion ended after 14.2 s (peak area 7.1%)`. Each segment's log line now ends in `motion=yes` or `motion=no`. Phase 7 will store both in SQLite.
-- **Robustness:** OpenCV is loaded **before** the camera starts (the same lesson as PyAV). If OpenCV is missing, recording still works, with motion detection disabled and an error in the log.
+The "prefer motion footage when deleting" retention mode from the design isn't included yet. It's the only planned storage feature still missing, and I'll add it with the Storage settings page in Phase 8. For now, `oldest_first` plus the optional `max_age_days` is the retention behaviour.
 
 ## What I tested here
 
-**Synthetic 60-second scene with realistic sensor noise.** Results before and after the selective-learning change:
+**Database on its own:**
+- An event that spanned 16:00 and 16:05 was linked to both segments, including the one that finished while the event was still ongoing.
+- An event left open at a simulated crash was closed on restart.
+- Reconcile added a `.recovered.mp4` (with its real 12.0 s length from `ffprobe`) and removed the row for a deleted file.
+- **Deliberate corruption:** I overwrote 4 KB of the database file. It was moved aside, the backup restored, the integrity check came back `ok`, and the index was rebuilt from the files.
+- Renaming the camera kept all recordings on camera ID 1.
 
-| Scenario | Before | After (shipped) |
-|---|---|---|
-| A single-frame blip at 10 s | ignored | ignored |
-| Walking at 20–26 s, pausing 4 s, walking back 30–33 s | one event, 20.0–33.0 s | one event, **20.0–32.8 s** |
-| Lights switching on | recognised, not reported as motion | same |
-| Walking in, then standing still | not measured | event ends about 15 s after they stop |
+**End to end with the fake camera:**
+- The 11.8 s event was linked to the right segment; the next segment had `motion=no`.
+- The report tool read the database safely both while the recorder was writing and after it stopped.
+- After a `kill -9` and restart, the index still matched the folder.
 
-**Fake camera, end to end:** a moving object from 20 to 32 s after start gave one event. The two segments overlapping it were marked `motion=yes` and the next one `motion=no`.
+**Update script:** it turns your 0.6.0 files into files identical to the tested ones, and aborts safely if run twice.
 
-**Tuning tool:** it caught 11.8 s of the 12 s movement, the quiet-scene noise level was 0.00 %, and analysis took 0.3 ms per frame on this machine (expect a few ms on the Pi). Its debug image showed only the moving object in the mask, with no noise.
+## Install (optional)
 
-## Install
+This gives you the `sqlite3` command for looking inside the database yourself:
 
 ```bash
-sudo apt install -y python3-opencv
-python3 -c "import cv2; print(cv2.__version__)"
+sudo apt install -y sqlite3
 ```
 
 ## Update the files
 
-**1. Apply the update script.** It changes `__init__.py`, `config.py`, `recorder.py`, `storage_manager.py` and the two report tools. It checks that every piece of code it replaces is exactly what I gave you in Phase 5, makes `.bak` backups, and changes nothing if any check fails. I tested it on copies of your 0.5.0 files: the result is identical to what I tested, and running it twice safely aborts.
+**1. Apply the update.** It changes `__init__.py`, `config.py`, `storage_manager.py`, `motion_detector.py` and `main.py`, checks every piece of code it replaces, and makes `.bak` backups.
 
 ```bash
 cd ~/surveillance
-cat > update_to_0_6_0.py <<'EOF'
+cat > update_to_0_7_0.py <<'EOF'
 #!/usr/bin/env python3
-"""Update the surveillance project from 0.5.0 to 0.6.0 (run from ~/surveillance)."""
+"""Update the surveillance project from 0.6.0 to 0.7.0 (run from ~/surveillance)."""
 import shutil, sys
 from pathlib import Path
 
 EDITS = [
     ('app/__init__.py',
-     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.5.0"\n',
-     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.6.0"\n'),
+     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.6.0"\n',
+     '"""Raspberry Pi surveillance camera."""\n\n__version__ = "0.7.0"\n'),
     ('app/config.py',
-     '\n@dataclass(frozen=True)\nclass PathSettings:\n    recordings_dir: str = "recordings"\n',
-     '\n@dataclass(frozen=True)\nclass MotionSettings:\n    enabled: bool = True\n    sensitivity: int = 70\n    min_area_percent: float = 0.5\n    cooldown_seconds: float = 10.0\n    trigger_frames: int = 3\n    analysis_fps: float = 5.0\n\n    def validate(self) -> None:\n        _check_range("motion.sensitivity", self.sensitivity, 1, 100)\n        _check_range("motion.min_area_percent", self.min_area_percent, 0.05, 50.0)\n        _check_range("motion.cooldown_seconds", self.cooldown_seconds, 1.0, 300.0)\n        _check_range("motion.trigger_frames", self.trigger_frames, 1, 20)\n        _check_range("motion.analysis_fps", self.analysis_fps, 1.0, 15.0)\n\n\n@dataclass(frozen=True)\nclass PathSettings:\n    recordings_dir: str = "recordings"\n'),
+     '    trigger_frames: int = 3\n    analysis_fps: float = 5.0\n\n    def validate(self) -> None:\n        _check_range("motion.sensitivity", self.sensitivity, 1, 100)\n        _check_range("motion.min_area_percent", self.min_area_percent, 0.05, 50.0)\n',
+     '    trigger_frames: int = 3\n    analysis_fps: float = 5.0\n    keep_events_days: int = 90\n\n    def validate(self) -> None:\n        _check_range("motion.keep_events_days", self.keep_events_days, 0, 3650)\n        _check_range("motion.sensitivity", self.sensitivity, 1, 100)\n        _check_range("motion.min_area_percent", self.min_area_percent, 0.05, 50.0)\n'),
     ('app/config.py',
-     '    recording: RecordingSettings = field(default_factory=RecordingSettings)\n    storage: StorageSettings = field(default_factory=StorageSettings)\n    paths: PathSettings = field(default_factory=PathSettings)\n    logging: LoggingSettings = field(default_factory=LoggingSettings)\n',
-     '    recording: RecordingSettings = field(default_factory=RecordingSettings)\n    storage: StorageSettings = field(default_factory=StorageSettings)\n    motion: MotionSettings = field(default_factory=MotionSettings)\n    paths: PathSettings = field(default_factory=PathSettings)\n    logging: LoggingSettings = field(default_factory=LoggingSettings)\n'),
+     'class PathSettings:\n    recordings_dir: str = "recordings"\n    log_dir: str = "logs"\n\n    def validate(self) -> None:\n        for name in ("recordings_dir", "log_dir"):\n            value = getattr(self, name)\n            if not value.strip() or "\\x00" in value:\n',
+     'class PathSettings:\n    recordings_dir: str = "recordings"\n    database_dir: str = "database"\n    log_dir: str = "logs"\n\n    def validate(self) -> None:\n        for name in ("recordings_dir", "database_dir", "log_dir"):\n            value = getattr(self, name)\n            if not value.strip() or "\\x00" in value:\n'),
     ('app/config.py',
-     '        for section in fields(self):\n            getattr(self, section.name).validate()\n        mount = self.storage.required_mount\n        if mount and not self.recordings_dir.is_relative_to(Path(mount)):\n',
-     '        for section in fields(self):\n            getattr(self, section.name).validate()\n        if self.motion.analysis_fps > self.camera.framerate:\n            raise ConfigError("motion.analysis_fps cannot be higher than camera.framerate")\n        mount = self.storage.required_mount\n        if mount and not self.recordings_dir.is_relative_to(Path(mount)):\n'),
-    ('app/recorder.py',
-     'from __future__ import annotations\n\nimport logging\nimport math\n',
-     'from __future__ import annotations\n\nimport dataclasses\nimport logging\nimport math\n'),
-    ('app/recorder.py',
-     '    frames: int\n    clock_synced: bool | None\n\n\n',
-     '    frames: int\n    clock_synced: bool | None\n    has_motion: bool | None = None   # None when motion detection is off\n\n\n'),
-    ('app/recorder.py',
-     '        self._boundary_thread: threading.Thread | None = None\n        self._listeners: list[Callable[[Segment], None]] = []\n        self.last_segment: Segment | None = None\n\n    def add_listener(self, callback: Callable[[Segment], None]) -> None:\n        self._listeners.append(callback)\n\n    @property\n',
-     '        self._boundary_thread: threading.Thread | None = None\n        self._listeners: list[Callable[[Segment], None]] = []\n        self._motion = None\n        self._motion_listeners: list[Callable] = []\n        self.last_segment: Segment | None = None\n\n    def add_listener(self, callback: Callable[[Segment], None]) -> None:\n        self._listeners.append(callback)\n\n    def add_motion_listener(self, callback: Callable) -> None:\n        """callback(kind, event) with kind \'start\' or \'end\'."""\n        self._motion_listeners.append(callback)\n\n    @property\n    def motion_active(self) -> bool | None:\n        return self._motion.active if self._motion else None\n\n    @property\n'),
-    ('app/recorder.py',
-     '        if not os.access(self.recordings_dir, os.W_OK):\n            raise PermissionError(f"recordings directory is not writable: {self.recordings_dir}")\n        self._finalizer.start()\n\n',
-     '        if not os.access(self.recordings_dir, os.W_OK):\n            raise PermissionError(f"recordings directory is not writable: {self.recordings_dir}")\n        # Imported before the encoder starts: loading OpenCV holds the interpreter lock long\n        # enough to make the encoder thread drop frames.\n        motion_detector_cls = self._load_motion_detector() if self.settings.motion.enabled else None\n        self._finalizer.start()\n\n'),
-    ('app/recorder.py',
-     '                 self.recordings_dir, self.settings.recording.segment_seconds, cam.bitrate / 1e6,\n                 cam.keyframe_seconds)\n\n    def stop(self) -> None:\n        was_recording = self._recording\n        self._boundary_stop.set()\n        if self._boundary_thread is not None and self._boundary_thread.is_alive():\n',
-     '                 self.recordings_dir, self.settings.recording.segment_seconds, cam.bitrate / 1e6,\n                 cam.keyframe_seconds)\n        if motion_detector_cls is not None:\n            self._motion = motion_detector_cls(self._camera.picam2, self.settings.motion,\n                                               self._motion_listeners)\n            self._motion.start()\n\n    @staticmethod\n    def _load_motion_detector():\n        try:\n            from app.motion_detector import MotionDetector\n        except ImportError as exc:\n            log.error("Motion detection disabled: OpenCV is not installed (%s). "\n                      "Install it with: sudo apt install -y python3-opencv", exc)\n            return None\n        return MotionDetector\n\n    def stop(self) -> None:\n        was_recording = self._recording\n        if self._motion is not None:\n            self._motion.stop()\n        self._boundary_stop.set()\n        if self._boundary_thread is not None and self._boundary_thread.is_alive():\n'),
-    ('app/recorder.py',
-     '        fsync_directory(seg.final_path.parent)\n        segment = self._output.segment_metadata(seg, seg.final_path.stat().st_size)\n        self.last_segment = segment\n        log.info("Segment completed: %s start=%s duration=%.1fs frames=%d size=%.1fMB%s",\n                 segment.rel_path, segment.start_utc.isoformat(timespec="milliseconds"),\n                 segment.duration_s, segment.frames, segment.size_bytes / 1e6,\n                 {True: "", False: " (clock NOT synchronised)"}.get(segment.clock_synced,\n                                                                     " (clock sync unknown)"))\n',
-     '        fsync_directory(seg.final_path.parent)\n        segment = self._output.segment_metadata(seg, seg.final_path.stat().st_size)\n        if self._motion is not None:\n            events = self._motion.events_between(segment.start_utc.timestamp(), segment.end_utc.timestamp())\n            segment = dataclasses.replace(segment, has_motion=bool(events))\n        self.last_segment = segment\n        log.info("Segment completed: %s start=%s duration=%.1fs frames=%d size=%.1fMB%s%s",\n                 segment.rel_path, segment.start_utc.isoformat(timespec="milliseconds"),\n                 segment.duration_s, segment.frames, segment.size_bytes / 1e6,\n                 {True: " motion=yes", False: " motion=no"}.get(segment.has_motion, ""),\n                 {True: "", False: " (clock NOT synchronised)"}.get(segment.clock_synced,\n                                                                     " (clock sync unknown)"))\n'),
+     '    def recordings_dir(self) -> Path:\n        return resolve_path(self.paths.recordings_dir)\n\n    @property\n',
+     '    def recordings_dir(self) -> Path:\n        return resolve_path(self.paths.recordings_dir)\n\n    @property\n    def database_dir(self) -> Path:\n        return resolve_path(self.paths.database_dir)\n\n    @property\n'),
     ('app/storage_manager.py',
-     '        if not self._warned_capacity and self._max_bytes > used + disk.free - self._min_free_bytes:\n            self._warned_capacity = True\n            log.warning("Maximum storage %.1f GB does not fit on this disk while keeping %.1f GB free "\n                        "(room for about %.1f GB); the free-space limit will apply first",\n                        self._max_bytes / GB, self._min_free_bytes / GB,\n                        max(0, used + disk.free - self._min_free_bytes) / GB)\n',
-     '        if not self._warned_capacity and self._max_bytes > used + disk.free - self._min_free_bytes:\n            self._warned_capacity = True\n            log.warning("Maximum storage %g GB does not fit on this disk while keeping %g GB free "\n                        "(room for about %.2f GB); the free-space limit will apply first",\n                        self._max_bytes / GB, self._min_free_bytes / GB,\n                        max(0, used + disk.free - self._min_free_bytes) / GB)\n'),
+     '\nclass StorageManager:\n    def __init__(self, settings: Settings, current_segment: Callable[[], Path | None]) -> None:\n        s = settings.storage\n        self.root = settings.recordings_dir\n        self._required_mount = Path(s.required_mount) if s.required_mount else None\n',
+     '\nclass StorageManager:\n    def __init__(self, settings: Settings, current_segment: Callable[[], Path | None],\n                 on_deleted: Callable[[list[str]], None] | None = None,\n                 on_recovered: Callable[[str, float, int, float], None] | None = None) -> None:\n        s = settings.storage\n        self._on_deleted = on_deleted\n        self._on_recovered = on_recovered\n        self.root = settings.recordings_dir\n        self._required_mount = Path(s.required_mount) if s.required_mount else None\n'),
     ('app/storage_manager.py',
-     '        elif disk.free < self._min_free_bytes:\n            state = "low"\n            message = (f"only {disk.free / GB:.2f} GB free (minimum {self._min_free_bytes / GB:g} GB); "\n                       f"something other than recordings is filling the disk")\n        elif used > self._max_bytes:\n            state = "low"\n',
-     '        elif disk.free < self._min_free_bytes:\n            state = "low"\n            message = (f"only {disk.free / GB:.2f} GB free (minimum {self._min_free_bytes / GB:g} GB) and no "\n                       f"older recordings left to delete; check what else is using the disk")\n        elif used > self._max_bytes:\n            state = "low"\n'),
-    ('tools/phase5_storage_report.py',
-     '          f"{fmt_time(complete[-1].start if complete else None)}")\n\n    full = [f for f in complete if f.start % seg_len == 0 and not f.path.name.endswith(RECOVERED_SUFFIX)]\n    sample = full[-BITRATE_SAMPLE_SEGMENTS - 1:-1] or full[-BITRATE_SAMPLE_SEGMENTS:]\n    if sample:\n        bytes_per_s = sum(f.size for f in sample) / (len(sample) * seg_len)\n',
-     '          f"{fmt_time(complete[-1].start if complete else None)}")\n\n    # Only segments that filled their whole slot (the next one starts exactly one length later).\n    full = [a for a, b in zip(complete, complete[1:])\n            if a.start % seg_len == 0 and b.start - a.start == seg_len\n            and not a.path.name.endswith(RECOVERED_SUFFIX)]\n    sample = full[-BITRATE_SAMPLE_SEGMENTS:]\n    if sample:\n        bytes_per_s = sum(f.size for f in sample) / (len(sample) * seg_len)\n'),
-    ('tools/phase4_check_segments.py',
-     '            continue\n        missing = (cur_start - prev_start).total_seconds() - prev_dur\n        # The first segment after a (re)start is named after its real start time, not a boundary.\n        restarted = cur_start.timestamp() % seg_len != 0\n        if restarted:\n            print(f"  [INFO] {prev.name} -> {cur.name}: recorder stopped/restarted, "\n',
-     '            continue\n        missing = (cur_start - prev_start).total_seconds() - prev_dur\n        # The first segment after a (re)start is named after its real start time, not a boundary;\n        # a restart that happens to land on a boundary shows up as a gap of more than 10 s.\n        restarted = cur_start.timestamp() % seg_len != 0 or missing > 10\n        if restarted:\n            print(f"  [INFO] {prev.name} -> {cur.name}: recorder stopped/restarted, "\n'),
+     '        freed = 0\n        deleted = 0\n        touched_days: set[Path] = set()\n        for f, reason in plan:\n',
+     '        freed = 0\n        deleted = 0\n        deleted_paths: list[str] = []\n        touched_days: set[Path] = set()\n        for f, reason in plan:\n'),
+    ('app/storage_manager.py',
+     '                f.path.unlink()\n            except FileNotFoundError:\n                continue\n            except OSError as exc:\n                log.error("Cannot delete %s: %s", f.rel_path, exc.strerror)\n                continue\n            deleted += 1\n            freed += f.size\n',
+     '                f.path.unlink()\n            except FileNotFoundError:\n                deleted_paths.append(f.rel_path)\n                continue\n            except OSError as exc:\n                log.error("Cannot delete %s: %s", f.rel_path, exc.strerror)\n                continue\n            deleted_paths.append(f.rel_path)\n            deleted += 1\n            freed += f.size\n'),
+    ('app/storage_manager.py',
+     '        if deleted > MAX_INDIVIDUAL_DELETE_LOGS:\n            log.info("Deleted %d segments in total, freeing %.1f GB", deleted, freed / GB)\n        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")\n        for day in touched_days:\n',
+     '        if deleted > MAX_INDIVIDUAL_DELETE_LOGS:\n            log.info("Deleted %d segments in total, freeing %.1f GB", deleted, freed / GB)\n        if deleted_paths and self._on_deleted:\n            self._on_deleted(deleted_paths)\n        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")\n        for day in touched_days:\n'),
+    ('app/storage_manager.py',
+     '        log.warning("Recovered unfinished segment %s -> %s: %.1f s playable%s", f.rel_path, recovered.name,\n                    seconds, f", removed {trimmed / 1024:.0f} KiB of incomplete data" if trimmed else "")\n        return True\n',
+     '        log.warning("Recovered unfinished segment %s -> %s: %.1f s playable%s", f.rel_path, recovered.name,\n                    seconds, f", removed {trimmed / 1024:.0f} KiB of incomplete data" if trimmed else "")\n        if self._on_recovered:\n            self._on_recovered(str(recovered.relative_to(self.root)), seconds, new_size, f.start)\n        return True\n'),
+    ('app/motion_detector.py',
+     'LIGHTING_CHANGE_PERCENT = 60.0\nRELEARN_SECONDS = 1.0\nMAX_EVENT_SECONDS = 3600.0\nCAPTURE_TIMEOUT_S = 2.0\n',
+     'LIGHTING_CHANGE_PERCENT = 60.0\nRELEARN_SECONDS = 1.0\nSTARTUP_SETTLE_SECONDS = 3.0   # auto-exposure is still adjusting right after the camera starts\nMAX_EVENT_SECONDS = 3600.0\nCAPTURE_TIMEOUT_S = 2.0\n'),
+    ('app/motion_detector.py',
+     '    end: float | None = None\n    peak_percent: float = 0.0\n\n    @property\n',
+     '    end: float | None = None\n    peak_percent: float = 0.0\n    db_id: int | None = None         # set by the database writer\n\n    @property\n'),
+    ('app/motion_detector.py',
+     '        if self._background is None:\n            self._background = blurred.astype(np.float32)\n            self._relearn_until = now + RELEARN_SECONDS\n            return FrameScore(0.0, 0.0, False, False)\n        if now < self._relearn_until:\n',
+     '        if self._background is None:\n            self._background = blurred.astype(np.float32)\n            self._relearn_until = now + STARTUP_SETTLE_SECONDS\n            return FrameScore(0.0, 0.0, False, False)\n        if now < self._relearn_until:\n'),
+    ('app/main.py',
+     'from app.clock import ClockMonitor  # noqa: E402\nfrom app.config import DEFAULT_CONFIG_PATH, ConfigError, Settings, load_settings  # noqa: E402\nfrom app.logging_setup import setup_logging  # noqa: E402\nfrom app.recorder import Recorder  # noqa: E402\n',
+     'from app.clock import ClockMonitor  # noqa: E402\nfrom app.config import DEFAULT_CONFIG_PATH, ConfigError, Settings, load_settings  # noqa: E402\nfrom app.database import Database  # noqa: E402\nfrom app.logging_setup import setup_logging  # noqa: E402\nfrom app.recorder import Recorder  # noqa: E402\n'),
+    ('app/main.py',
+     '\n\ndef run(settings: Settings, stop: threading.Event) -> None:\n    clock = ClockMonitor()\n    clock.start()\n    active: list[Recorder] = []\n    storage = StorageManager(settings, lambda: active[0].current_partial_path if active else None)\n    # Recover unfinished segments and free space before the camera starts writing.\n    try:\n',
+     '\n\ndef open_database(settings: Settings) -> Database | None:\n    db = Database(settings)\n    try:\n        db.open()\n    except Exception:  # noqa: BLE001 - recording must work even without the index\n        log.exception("Cannot open the database; recording continues without an index")\n        return None\n    db.start()\n    return db\n\n\ndef run(settings: Settings, stop: threading.Event) -> None:\n    clock = ClockMonitor()\n    clock.start()\n    db = open_database(settings)\n    active: list[Recorder] = []\n    storage = StorageManager(settings, lambda: active[0].current_partial_path if active else None,\n                             on_deleted=db.recordings_deleted if db else None,\n                             on_recovered=db.recording_recovered if db else None)\n    # Recover unfinished segments and free space before the camera starts writing.\n    try:\n'),
+    ('app/main.py',
+     '        log.exception("Initial storage check failed")\n    storage.start()\n    backoff = BACKOFF_INITIAL_S\n    try:\n',
+     '        log.exception("Initial storage check failed")\n    storage.start()\n    if db:\n        db.reconcile()\n    backoff = BACKOFF_INITIAL_S\n    try:\n'),
+    ('app/main.py',
+     '            recorder = Recorder(settings, clock, storage.can_write, storage.location_error)\n            recorder.add_listener(lambda _segment: storage.trigger())\n            active[:] = [recorder]\n            try:\n',
+     '            recorder = Recorder(settings, clock, storage.can_write, storage.location_error)\n            recorder.add_listener(lambda _segment: storage.trigger())\n            if db:\n                recorder.add_listener(db.add_segment)\n                recorder.add_motion_listener(db.motion_event)\n            active[:] = [recorder]\n            try:\n'),
+    ('app/main.py',
+     '        active.clear()\n        storage.stop()\n        clock.stop()\n\n',
+     '        active.clear()\n        storage.stop()\n        if db:\n            db.stop()\n        clock.stop()\n\n'),
 ]
 
 texts = {}
 for rel, old, new in EDITS:
     text = texts.setdefault(rel, Path(rel).read_text())
     if text.count(old) != 1:
-        sys.exit(f"ABORTED, nothing changed: {rel} does not match the expected 0.5.0 code "
+        sys.exit(f"ABORTED, nothing changed: {rel} does not match the expected 0.6.0 code "
                  f"(found {text.count(old)} matches for:\n{old})")
     texts[rel] = text.replace(old, new)
 for rel, text in texts.items():
     shutil.copy2(rel, rel + ".bak")
     Path(rel).write_text(text)
     print(f"updated {rel}  (backup: {rel}.bak)")
-print("Update to 0.6.0 complete.")
+print("Update to 0.7.0 complete.")
 EOF
-python3 update_to_0_6_0.py
+python3 update_to_0_7_0.py
 ```
 
-It should print six `updated …` lines and then `Update to 0.6.0 complete.` If it prints `ABORTED`, nothing was changed; send me the message.
+It should print five `updated …` lines and then `Update to 0.7.0 complete.`
 
-**2. The new motion detector:**
+**2. The new database module:**
 
 ```bash
-cat > ~/surveillance/app/motion_detector.py <<'EOF'
-"""Lightweight motion detection on the low-resolution stream.
+cat > ~/surveillance/app/database.py <<'EOF'
+"""SQLite index of recordings and motion events.
 
-No AI and no object recognition: each analysed frame is compared with a slowly updating
-background image, and the largest connected region of changed pixels decides whether
-something moved. Frame scores are turned into events with a debounce (movement must be
-seen in several frames in a row) and a cooldown (an event only ends after a quiet period),
-so one continuous movement produces one event.
+The recording files on disk are the source of truth; this database is an index that makes
+browsing, searching and the event timeline fast. It is written by one background thread,
+so the camera, encoder and motion threads never wait for the disk.
+
+Safety:
+  * WAL journal + synchronous=FULL: a committed change survives a power cut.
+  * At startup: integrity check; a damaged file is moved aside and the newest good backup
+    is restored (or a fresh database is created), then the index is rebuilt from the files.
+  * A backup copy is made once a day (VACUUM INTO), keeping the last few.
+  * Any database error is logged and recording carries on.
+
+All times are stored as UTC milliseconds since 1970 (INTEGER).
 """
 from __future__ import annotations
 
 import logging
+import queue
+import shutil
+import sqlite3
+import subprocess
 import threading
 import time
-from collections import deque
-from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable
 
-import cv2
-import numpy as np
+from app.config import Settings
+from app.storage_manager import RECOVERED_SUFFIX, scan_segments
 
-from app.config import MotionSettings
+log = logging.getLogger("Database")
 
-log = logging.getLogger("MotionDetector")
+SCHEMA_VERSION = 1
+DB_FILE_NAME = "surveillance.db"
+BACKUP_DIR_NAME = "backups"
+BACKUPS_KEPT = 3
+BACKUP_INTERVAL_S = 24 * 3600
+PRUNE_INTERVAL_S = 6 * 3600
+IDLE_WAKE_S = 60.0
 
-ANALYSIS_WIDTH = 320
-BLUR_KERNEL = (5, 5)
-BACKGROUND_ALPHA = 0.04
-MOVING_ALPHA_FACTOR = 0.5
-RELEARN_ALPHA = 0.5
-LIGHTING_CHANGE_PERCENT = 60.0
-RELEARN_SECONDS = 1.0
-MAX_EVENT_SECONDS = 3600.0
-CAPTURE_TIMEOUT_S = 2.0
-RECENT_EVENTS = 500
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 
+CREATE TABLE IF NOT EXISTS cameras (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    created_at  INTEGER NOT NULL
+);
 
-def sensitivity_to_threshold(sensitivity: int) -> int:
-    """Sensitivity 1..100 -> minimum brightness change (0..255) for a pixel to count as changed."""
-    return round(70 - 0.6 * sensitivity)
+CREATE TABLE IF NOT EXISTS recordings (
+    id           INTEGER PRIMARY KEY,
+    camera_id    INTEGER NOT NULL REFERENCES cameras(id),
+    rel_path     TEXT NOT NULL UNIQUE,          -- relative to recordings_dir
+    start_utc    INTEGER NOT NULL,
+    end_utc      INTEGER,
+    duration_ms  INTEGER,
+    size_bytes   INTEGER NOT NULL,
+    frames       INTEGER,
+    status       TEXT NOT NULL CHECK (status IN ('complete', 'recovered')),
+    has_motion   INTEGER NOT NULL DEFAULT 0,
+    clock_synced INTEGER,                        -- 1, 0, or NULL if unknown
+    created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recordings_camera_start ON recordings(camera_id, start_utc);
 
+CREATE TABLE IF NOT EXISTS motion_events (
+    id             INTEGER PRIMARY KEY,
+    camera_id      INTEGER NOT NULL REFERENCES cameras(id),
+    start_utc      INTEGER NOT NULL,
+    end_utc        INTEGER,                      -- NULL while the event is ongoing
+    duration_ms    INTEGER,
+    peak_area_pct  REAL,
+    created_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_motion_camera_start ON motion_events(camera_id, start_utc);
 
-@dataclass(frozen=True)
-class FrameScore:
-    largest_percent: float   # biggest connected changed region, % of the frame
-    total_percent: float     # all changed pixels, % of the frame
-    moving: bool
-    lighting_change: bool
+-- An event can span two segments, so events and recordings are linked many-to-many.
+CREATE TABLE IF NOT EXISTS motion_event_recordings (
+    event_id      INTEGER NOT NULL REFERENCES motion_events(id) ON DELETE CASCADE,
+    recording_id  INTEGER NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+    PRIMARY KEY (event_id, recording_id)
+);
+CREATE INDEX IF NOT EXISTS idx_links_recording ON motion_event_recordings(recording_id);
 
-
-@dataclass
-class MotionEvent:
-    start: float                     # UTC epoch seconds
-    end: float | None = None
-    peak_percent: float = 0.0
-
-    @property
-    def duration(self) -> float:
-        return (self.end if self.end is not None else time.time()) - self.start
-
-
-class MotionAnalyzer:
-    """Pure image analysis: feed greyscale frames, get a score. No camera and no threads."""
-
-    def __init__(self, settings: MotionSettings) -> None:
-        self.threshold = sensitivity_to_threshold(settings.sensitivity)
-        self.min_area_percent = settings.min_area_percent
-        self._background: np.ndarray | None = None
-        self._relearn_until = 0.0
-        self.last_mask: np.ndarray | None = None
-
-    def analyze(self, gray: np.ndarray, now: float) -> FrameScore:
-        blurred = cv2.GaussianBlur(gray, BLUR_KERNEL, 0)
-        if self._background is None:
-            self._background = blurred.astype(np.float32)
-            self._relearn_until = now + RELEARN_SECONDS
-            return FrameScore(0.0, 0.0, False, False)
-        if now < self._relearn_until:
-            cv2.accumulateWeighted(blurred, self._background, RELEARN_ALPHA)
-            return FrameScore(0.0, 0.0, False, False)
-
-        diff = cv2.absdiff(blurred, cv2.convertScaleAbs(self._background))
-        _, mask = cv2.threshold(diff, self.threshold, 255, cv2.THRESH_BINARY)
-        mask = cv2.dilate(mask, None, iterations=2)
-        self.last_mask = mask
-        # Moving pixels are learned more slowly so a moving object leaves little "ghost" trail
-        # behind it; something that stops (a parked car) still becomes background after a while.
-        cv2.accumulateWeighted(blurred, self._background, BACKGROUND_ALPHA, mask=cv2.bitwise_not(mask))
-        cv2.accumulateWeighted(blurred, self._background, BACKGROUND_ALPHA * MOVING_ALPHA_FACTOR, mask=mask)
-        total = cv2.countNonZero(mask) * 100.0 / mask.size
-        if total >= LIGHTING_CHANGE_PERCENT:
-            # Lights switched on/off or an exposure jump: relearn instead of reporting motion.
-            self._background = blurred.astype(np.float32)
-            self._relearn_until = now + RELEARN_SECONDS
-            return FrameScore(0.0, total, False, True)
-        count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        largest = float(stats[1:, cv2.CC_STAT_AREA].max()) * 100.0 / mask.size if count > 1 else 0.0
-        return FrameScore(largest, total, largest >= self.min_area_percent, False)
+-- The event list as originally sketched: one row per event with its first recording file.
+CREATE VIEW IF NOT EXISTS v_motion_events AS
+SELECT e.id, e.camera_id, e.start_utc, e.end_utc, e.duration_ms, e.peak_area_pct,
+       (SELECT r.rel_path FROM motion_event_recordings l JOIN recordings r ON r.id = l.recording_id
+         WHERE l.event_id = e.id ORDER BY r.start_utc LIMIT 1) AS recording_file,
+       e.created_at
+FROM motion_events e;
+"""
 
 
-class MotionEventTracker:
-    """Turns per-frame scores into events: debounce, cooldown, one event per continuous movement."""
-
-    def __init__(self, trigger_frames: int, cooldown_seconds: float,
-                 on_start: Callable[[MotionEvent], None], on_end: Callable[[MotionEvent], None]) -> None:
-        self._trigger_frames = trigger_frames
-        self._cooldown = cooldown_seconds
-        self._on_start = on_start
-        self._on_end = on_end
-        self._streak = 0
-        self._streak_start = 0.0
-        self._streak_peak = 0.0
-        self._last_motion = 0.0
-        self.current: MotionEvent | None = None
-
-    def update(self, moving: bool, percent: float, now: float) -> None:
-        if moving:
-            if self._streak == 0:
-                self._streak_start = now
-                self._streak_peak = 0.0
-            self._streak += 1
-            self._streak_peak = max(self._streak_peak, percent)
-            self._last_motion = now
-            if self.current is None:
-                if self._streak >= self._trigger_frames:
-                    self.current = MotionEvent(start=self._streak_start, peak_percent=self._streak_peak)
-                    self._on_start(self.current)
-            else:
-                self.current.peak_percent = max(self.current.peak_percent, percent)
-                if now - self.current.start >= MAX_EVENT_SECONDS:
-                    self._finish(now)
-                    self.current = MotionEvent(start=now, peak_percent=percent)
-                    self._on_start(self.current)
-        else:
-            self._streak = 0
-            if self.current is not None and now - self._last_motion >= self._cooldown:
-                self._finish(self._last_motion)
-
-    def flush(self) -> None:
-        if self.current is not None:
-            self._finish(self._last_motion)
-
-    def _finish(self, end: float) -> None:
-        event, self.current = self.current, None
-        event.end = max(end, event.start)
-        self._on_end(event)
+def now_ms() -> int:
+    return int(time.time() * 1000)
 
 
-@dataclass
-class _Stats:
-    frames: int = 0
-    processing_s: float = 0.0
-    last_score: FrameScore | None = None
-    recent: deque = field(default_factory=lambda: deque(maxlen=RECENT_EVENTS))
+def to_ms(epoch_seconds: float) -> int:
+    return int(round(epoch_seconds * 1000))
 
 
-class MotionDetector:
-    """Background thread that reads the lores stream of a running Picamera2 instance."""
+def connect(path: Path, read_only: bool = False) -> sqlite3.Connection:
+    if read_only:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    else:
+        # Opened by open() in the main thread, then used only by the writer thread.
+        conn = sqlite3.connect(path, timeout=5, isolation_level=None, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    def __init__(self, picam2, settings: MotionSettings,
-                 listeners: list[Callable[[str, MotionEvent], None]] | None = None) -> None:
-        self._picam2 = picam2
-        self._settings = settings
-        self._listeners = listeners or []
-        self._analyzer = MotionAnalyzer(settings)
-        self._tracker = MotionEventTracker(settings.trigger_frames, settings.cooldown_seconds,
-                                           self._started, self._ended)
-        self._stats = _Stats()
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="motion-detector", daemon=True)
 
-    @property
-    def active(self) -> bool:
-        return self._tracker.current is not None
+def probe_duration_ms(path: Path) -> int | None:
+    try:
+        result = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                 "-of", "csv=p=0", str(path)],
+                                capture_output=True, text=True, timeout=30, check=False)
+        return int(float(result.stdout.strip()) * 1000)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
 
-    @property
-    def average_processing_ms(self) -> float:
-        s = self._stats
-        return s.processing_s / s.frames * 1000 if s.frames else 0.0
 
-    def events_between(self, start: float, end: float) -> list[MotionEvent]:
-        """Events (finished or ongoing) that overlap [start, end]."""
-        with self._lock:
-            events = list(self._stats.recent)
-        now = time.time()
-        return [e for e in events if e.start <= end and (e.end if e.end is not None else now) >= start]
+class Database:
+    def __init__(self, settings: Settings) -> None:
+        self.path = settings.database_dir / DB_FILE_NAME
+        self.backup_dir = settings.database_dir / BACKUP_DIR_NAME
+        self.recordings_dir = settings.recordings_dir
+        self._camera_name = settings.camera.name
+        self._keep_events_days = settings.motion.keep_events_days
+        self._segment_ms = settings.recording.segment_seconds * 1000
+        self._conn: sqlite3.Connection | None = None
+        self.camera_id = settings.camera.camera_num + 1
+        self._queue: queue.Queue[tuple[Callable, tuple] | None] = queue.Queue()
+        self._thread = threading.Thread(target=self._run, name="database-writer", daemon=True)
+        self._last_backup = 0.0
+        self._last_prune = 0.0
+        self.healthy = True
+
+    # ---------------------------------------------------------------- lifecycle
+    def open(self) -> None:
+        """Open (checking, restoring or creating) the database. Call before start()."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists() and not self._integrity_ok(self.path):
+            self._replace_damaged_database()
+        self._conn = connect(self.path)
+        self._conn.executescript(SCHEMA)  # idempotent; executescript commits on its own
+        with self._transaction():
+            row = self._conn.execute("SELECT version FROM schema_version").fetchone()
+            if row is None:
+                self._conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+            elif row["version"] > SCHEMA_VERSION:
+                raise sqlite3.DatabaseError(f"database schema {row['version']} is newer than this program")
+            # The camera number is the stable identity; the name is only a label that may change.
+            self._conn.execute("INSERT OR IGNORE INTO cameras (id, name, created_at) VALUES (?, ?, ?)",
+                               (self.camera_id, self._camera_name, now_ms()))
+            self._conn.execute("UPDATE cameras SET name = ? WHERE id = ?", (self._camera_name, self.camera_id))
+            closed = self._conn.execute(
+                "UPDATE motion_events SET end_utc = start_utc, duration_ms = 0 WHERE end_utc IS NULL").rowcount
+        if closed:
+            log.warning("Closed %d motion event(s) left open by a crash or power cut", closed)
+        self._last_backup = self._newest_backup_time()
+        log.info("Database ready: %s", self.path)
 
     def start(self) -> None:
-        log.info("Motion detection on: sensitivity %d (pixel threshold %d), min area %.2f%%, "
-                 "cooldown %g s, %g analysed frames/s", self._settings.sensitivity,
-                 self._analyzer.threshold, self._settings.min_area_percent,
-                 self._settings.cooldown_seconds, self._settings.analysis_fps)
         self._thread.start()
 
     def stop(self) -> None:
-        self._stop.set()
         if self._thread.is_alive():
-            self._thread.join(timeout=CAPTURE_TIMEOUT_S + 3)
-        self._tracker.flush()
+            self._queue.put(None)
+            self._thread.join(timeout=60)
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
 
-    def _started(self, event: MotionEvent) -> None:
-        with self._lock:
-            self._stats.recent.append(event)
-        log.info("Motion started (area %.1f%% of the frame)", event.peak_percent)
-        self._notify("start", event)
+    # ------------------------------------------------------- queued write API
+    def reconcile(self) -> None:
+        self._submit(self._reconcile)
 
-    def _ended(self, event: MotionEvent) -> None:
-        log.info("Motion ended after %.1f s (peak area %.1f%%)", event.end - event.start, event.peak_percent)
-        self._notify("end", event)
+    def add_segment(self, segment) -> None:
+        """Recorder listener: a segment has been completed and renamed to .mp4."""
+        self._submit(self._insert_recording, segment.rel_path, to_ms(segment.start_utc.timestamp()),
+                     to_ms(segment.end_utc.timestamp()), int(segment.duration_s * 1000),
+                     segment.size_bytes, segment.frames, "complete", segment.clock_synced)
 
-    def _notify(self, kind: str, event: MotionEvent) -> None:
-        for callback in self._listeners:
-            try:
-                callback(kind, event)
-            except Exception:  # noqa: BLE001
-                log.exception("Motion listener failed")
+    def recording_recovered(self, rel_path: str, seconds: float, size_bytes: int, start: float) -> None:
+        """Storage-manager listener: an unfinished segment was repaired."""
+        self._submit(self._insert_recording, rel_path, to_ms(start), to_ms(start + seconds),
+                     int(seconds * 1000), size_bytes, None, "recovered", None)
+
+    def recordings_deleted(self, rel_paths: list[str]) -> None:
+        """Storage-manager listener: these files were deleted."""
+        self._submit(self._delete_recordings, list(rel_paths))
+
+    def motion_event(self, kind: str, event) -> None:
+        """Motion-detector listener: kind is 'start' or 'end'."""
+        if kind == "start":
+            self._submit(self._event_started, event)
+        else:
+            self._submit(self._event_ended, event)
+
+    # ------------------------------------------------------------ internals
+    def _submit(self, fn: Callable, *args) -> None:
+        self._queue.put((fn, args))
 
     def _run(self) -> None:
-        stream = self._picam2.stream_configuration("lores")
-        width, height = stream["size"]
-        stride = stream["stride"]
-        step = max(1, width // ANALYSIS_WIDTH)
-        interval = 1.0 / self._settings.analysis_fps
-        next_due = time.monotonic()
-        while not self._stop.is_set():
+        while True:
             try:
-                buffer = self._picam2.capture_buffer("lores", wait=CAPTURE_TIMEOUT_S)
-            except TimeoutError:
-                continue  # the recorder's health check handles a stalled camera
-            except Exception as exc:  # noqa: BLE001
-                if self._stop.is_set():
-                    return
-                log.error("Cannot read the low-resolution stream: %s", exc)
-                self._stop.wait(1.0)
-                continue
-            now = time.time()
-            # YUV420: the first stride*height bytes are the Y (greyscale) plane.
-            gray = np.ascontiguousarray(buffer[: stride * height].reshape(height, stride)[::step, :width:step])
-            started = time.perf_counter()
-            score = self._analyzer.analyze(gray, now)
-            self._tracker.update(score.moving, score.largest_percent, now)
-            self._stats.processing_s += time.perf_counter() - started
-            self._stats.frames += 1
-            self._stats.last_score = score
-            if score.lighting_change:
-                log.debug("Lighting change (%.0f%% of pixels changed); background relearned", score.total_percent)
+                item = self._queue.get(timeout=IDLE_WAKE_S)
+            except queue.Empty:
+                item = ()
+            if item is None:
+                return
+            try:
+                if item:
+                    fn, args = item
+                    fn(*args)
+                self._maintenance()
+                if not self.healthy:
+                    log.info("Database writes are working again")
+                    self.healthy = True
+            except sqlite3.Error as exc:
+                if self.healthy:
+                    log.error("Database error (recording continues; the index is rebuilt at the next "
+                              "start): %s", exc)
+                self.healthy = False
+            except Exception:  # noqa: BLE001 - the writer thread must survive
+                log.exception("Unexpected error in the database writer")
 
-            next_due += interval
-            delay = next_due - time.monotonic()
-            if delay > 0:
-                self._stop.wait(delay)
-            else:
-                next_due = time.monotonic()
+    def _transaction(self):
+        conn = self._conn
+
+        class _Tx:
+            def __enter__(self_inner):
+                conn.execute("BEGIN IMMEDIATE")
+                return conn
+
+            def __exit__(self_inner, exc_type, exc, tb):
+                conn.execute("ROLLBACK" if exc_type else "COMMIT")
+                return False
+        return _Tx()
+
+    def _insert_recording(self, rel_path: str, start_ms: int, end_ms: int | None, duration_ms: int | None,
+                          size_bytes: int, frames: int | None, status: str, clock_synced: bool | None) -> None:
+        with self._transaction() as conn:
+            conn.execute(
+                "INSERT INTO recordings (camera_id, rel_path, start_utc, end_utc, duration_ms, size_bytes, frames,"
+                " status, clock_synced, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(rel_path) DO UPDATE SET start_utc = excluded.start_utc, end_utc = excluded.end_utc,"
+                " duration_ms = excluded.duration_ms, size_bytes = excluded.size_bytes, frames = excluded.frames,"
+                " status = excluded.status, clock_synced = excluded.clock_synced",
+                (self.camera_id, rel_path, start_ms, end_ms, duration_ms, size_bytes, frames, status,
+                 None if clock_synced is None else int(clock_synced), now_ms()))
+            recording_id = conn.execute("SELECT id FROM recordings WHERE rel_path = ?", (rel_path,)).fetchone()["id"]
+            self._link_recording(conn, recording_id, start_ms, end_ms if end_ms is not None else start_ms)
+
+    def _link_recording(self, conn: sqlite3.Connection, recording_id: int, start_ms: int, end_ms: int) -> None:
+        conn.execute(
+            "INSERT OR IGNORE INTO motion_event_recordings (event_id, recording_id)"
+            " SELECT id, ? FROM motion_events WHERE camera_id = ? AND start_utc <= ?"
+            " AND (end_utc IS NULL OR end_utc >= ?)", (recording_id, self.camera_id, end_ms, start_ms))
+        conn.execute("UPDATE recordings SET has_motion = EXISTS (SELECT 1 FROM motion_event_recordings"
+                     " WHERE recording_id = ?) WHERE id = ?", (recording_id, recording_id))
+
+    def _delete_recordings(self, rel_paths: list[str]) -> None:
+        with self._transaction() as conn:
+            conn.executemany("DELETE FROM recordings WHERE rel_path = ?", [(p,) for p in rel_paths])
+
+    def _event_started(self, event) -> None:
+        with self._transaction() as conn:
+            cursor = conn.execute(
+                "INSERT INTO motion_events (camera_id, start_utc, peak_area_pct, created_at) VALUES (?, ?, ?, ?)",
+                (self.camera_id, to_ms(event.start), round(event.peak_percent, 2), now_ms()))
+            event.db_id = cursor.lastrowid
+
+    def _event_ended(self, event) -> None:
+        if getattr(event, "db_id", None) is None:
+            return
+        start_ms, end_ms = to_ms(event.start), to_ms(event.end)
+        with self._transaction() as conn:
+            conn.execute("UPDATE motion_events SET end_utc = ?, duration_ms = ?, peak_area_pct = ? WHERE id = ?",
+                         (end_ms, end_ms - start_ms, round(event.peak_percent, 2), event.db_id))
+            rows = conn.execute("SELECT id FROM recordings WHERE camera_id = ? AND start_utc <= ?"
+                                " AND end_utc >= ?", (self.camera_id, end_ms, start_ms)).fetchall()
+            for row in rows:
+                conn.execute("INSERT OR IGNORE INTO motion_event_recordings (event_id, recording_id)"
+                             " VALUES (?, ?)", (event.db_id, row["id"]))
+                conn.execute("UPDATE recordings SET has_motion = 1 WHERE id = ?", (row["id"],))
+
+    def _reconcile(self) -> None:
+        """Make the index match the files on disk (files are the source of truth)."""
+        on_disk = {f.rel_path: f for f in scan_segments(self.recordings_dir) if not f.partial}
+        in_db = {row["rel_path"] for row in self._conn.execute(
+            "SELECT rel_path FROM recordings WHERE camera_id = ?", (self.camera_id,))}
+        stale = sorted(in_db - set(on_disk))
+        if stale:
+            self._delete_recordings(stale)
+        missing = sorted(set(on_disk) - in_db)
+        for rel_path in missing:
+            f = on_disk[rel_path]
+            duration_ms = probe_duration_ms(f.path) or self._segment_ms
+            start_ms = to_ms(f.start)
+            status = "recovered" if rel_path.endswith(RECOVERED_SUFFIX) else "complete"
+            self._insert_recording(rel_path, start_ms, start_ms + duration_ms, duration_ms,
+                                   f.path.stat().st_size, None, status, None)
+        if stale or missing:
+            log.info("Index reconciled with the recordings folder: %d added, %d removed", len(missing), len(stale))
+        else:
+            log.info("Index matches the recordings folder (%d recordings)", len(on_disk))
+
+    def _maintenance(self) -> None:
+        now = time.time()
+        if now - self._last_prune >= PRUNE_INTERVAL_S:
+            self._last_prune = now
+            if self._keep_events_days:
+                cutoff = now_ms() - self._keep_events_days * 86_400_000
+                with self._transaction() as conn:
+                    pruned = conn.execute(
+                        "DELETE FROM motion_events WHERE camera_id = ? AND start_utc < ? AND id NOT IN"
+                        " (SELECT event_id FROM motion_event_recordings)", (self.camera_id, cutoff)).rowcount
+                if pruned:
+                    log.info("Removed %d motion event(s) older than %d days", pruned, self._keep_events_days)
+        if now - self._last_backup >= BACKUP_INTERVAL_S:
+            self._last_backup = now
+            self._backup()
+
+    def _backup(self) -> None:
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        target = self.backup_dir / f"surveillance-{stamp}.db"
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.unlink(missing_ok=True)
+        self._conn.execute("VACUUM INTO ?", (str(tmp),))
+        tmp.replace(target)
+        for old in sorted(self.backup_dir.glob("surveillance-*.db"))[:-BACKUPS_KEPT]:
+            old.unlink(missing_ok=True)
+        log.info("Database backup written: %s", target.name)
+
+    def _newest_backup_time(self) -> float:
+        backups = sorted(self.backup_dir.glob("surveillance-*.db"))
+        return backups[-1].stat().st_mtime if backups else 0.0
+
+    @staticmethod
+    def _integrity_ok(path: Path) -> bool:
+        try:
+            conn = sqlite3.connect(path, timeout=5)
+            try:
+                return conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return False
+
+    def _replace_damaged_database(self) -> None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        for suffix in ("", "-wal", "-shm"):
+            part = Path(str(self.path) + suffix)
+            if part.exists():
+                part.rename(Path(f"{self.path}.corrupt-{stamp}{suffix}"))
+        log.error("Database failed its integrity check; moved aside as %s.corrupt-%s", self.path.name, stamp)
+        for backup in sorted(self.backup_dir.glob("surveillance-*.db"), reverse=True):
+            if self._integrity_ok(backup):
+                shutil.copy2(backup, self.path)
+                log.warning("Restored the database from backup %s; the index will be rebuilt from the files",
+                            backup.name)
+                return
+        log.warning("No usable backup; starting a new database and rebuilding it from the files")
 EOF
 ```
 
-**3. The tuning tool:**
+**3. The report tool.** It's read-only, so it's safe to run while the recorder is running.
 
 ```bash
-cat > ~/surveillance/tools/phase6_motion_tune.py <<'EOF'
+cat > ~/surveillance/tools/phase7_db_report.py <<'EOF'
 #!/usr/bin/env python3
-"""Phase 6: watch live motion scores to tune sensitivity and minimum area.
+"""Phase 7: read-only view of the recordings/motion database (safe while the recorder runs).
 
-Stop the recorder first (only one program can use the camera), then run:
+    python3 ~/surveillance/tools/phase7_db_report.py [--date YYYY-MM-DD] [--motion-only]
 
-    python3 ~/surveillance/tools/phase6_motion_tune.py [--seconds 60] [--sensitivity N]
-                                                      [--min-area PERCENT] [--save-every 5]
-
-Once per second it prints the largest moving region (% of the frame) and whether that
-counts as motion. At the end it reports the noise level of a quiet scene, so you can check
-that min_area_percent sits safely above it. --save-every writes side-by-side images
-(camera view | changed pixels) to ~/surveillance/snapshots/phase6/.
+Shows an integrity check, totals, and for one day (your local time zone) a timeline,
+the recordings and the motion events with the recording files they are linked to.
 """
 from __future__ import annotations
 
 import argparse
-import dataclasses
-import os
+import sqlite3
 import sys
-import time
+from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 
-os.environ.setdefault("LIBCAMERA_LOG_LEVELS", "*:WARN")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import cv2  # noqa: E402
-import numpy as np  # noqa: E402
-
-from app.camera import Camera, CameraError  # noqa: E402
 from app.config import DEFAULT_CONFIG_PATH, ConfigError, load_settings  # noqa: E402
-from app.motion_detector import ANALYSIS_WIDTH, MotionAnalyzer, MotionEventTracker  # noqa: E402
+from app.database import DB_FILE_NAME, connect  # noqa: E402
 
-SNAPSHOT_DIR = Path(__file__).resolve().parent.parent / "snapshots" / "phase6"
-BAR_WIDTH = 30
-
-
-def bar(percent: float, scale: float) -> str:
-    filled = min(BAR_WIDTH, int(percent / scale * BAR_WIDTH)) if scale else 0
-    return "#" * filled + "." * (BAR_WIDTH - filled)
+TIMELINE_SLOTS = 48  # 30 minutes each
 
 
-def percentile(values: list[float], pct: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    return ordered[min(len(ordered) - 1, int(len(ordered) * pct / 100))]
+def local(ms: int | None) -> datetime | None:
+    return datetime.fromtimestamp(ms / 1000).astimezone() if ms is not None else None
+
+
+def fmt_duration(ms: int | None) -> str:
+    if ms is None:
+        return "?"
+    seconds = ms / 1000
+    return f"{seconds / 60:.1f} min" if seconds >= 90 else f"{seconds:.1f} s"
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Phase 6: motion tuning")
+    parser = argparse.ArgumentParser(description="Phase 7: database report (read-only)")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--seconds", type=int, default=60)
-    parser.add_argument("--sensitivity", type=int, help="override motion.sensitivity (1-100)")
-    parser.add_argument("--min-area", type=float, help="override motion.min_area_percent")
-    parser.add_argument("--save-every", type=float, default=0, help="save a debug image every N seconds")
+    parser.add_argument("--date", help="local date YYYY-MM-DD (default: today)")
+    parser.add_argument("--motion-only", action="store_true", help="only list recordings with motion")
     args = parser.parse_args()
-    if os.geteuid() == 0:
-        print("Do not run this as root.", file=sys.stderr)
-        return 2
-
     try:
         settings, _ = load_settings(args.config, create_if_missing=False)
-        motion = settings.motion
-        if args.sensitivity is not None:
-            motion = dataclasses.replace(motion, sensitivity=args.sensitivity)
-        if args.min_area is not None:
-            motion = dataclasses.replace(motion, min_area_percent=args.min_area)
-        motion.validate()
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
-
-    camera = Camera(settings.camera)
-    try:
-        camera.open()
-    except CameraError as exc:
-        print(f"{exc}\nIs the recorder still running? Stop it first (Ctrl+C in its window).", file=sys.stderr)
+    path = settings.database_dir / DB_FILE_NAME
+    if not path.exists():
+        print(f"No database yet at {path}. Start the recorder once first.")
         return 1
 
-    analyzer = MotionAnalyzer(motion)
-    events: list[tuple[float, float, float]] = []
-    tracker = MotionEventTracker(
-        motion.trigger_frames, motion.cooldown_seconds,
-        on_start=lambda e: print(f"  >>> MOTION STARTED (area {e.peak_percent:.1f}%)", flush=True),
-        on_end=lambda e: (events.append((e.start, e.end, e.peak_percent)),
-                          print(f"  <<< motion ended after {e.end - e.start:.1f} s "
-                                f"(peak {e.peak_percent:.1f}%)", flush=True)))
-    if args.save_every:
-        SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    conn = connect(path, read_only=True)
+    check = conn.execute("PRAGMA quick_check").fetchone()[0]
+    totals = conn.execute(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS bytes, COALESCE(SUM(duration_ms), 0) AS ms,"
+        " SUM(has_motion) AS motion, SUM(status = 'recovered') AS recovered,"
+        " MIN(start_utc) AS first, MAX(start_utc) AS last FROM recordings").fetchone()
+    events_total = conn.execute("SELECT COUNT(*) FROM motion_events").fetchone()[0]
+    print(f"Database        : {path}  (integrity: {check})")
+    print(f"Recordings      : {totals['n']} ({totals['motion'] or 0} with motion, "
+          f"{totals['recovered'] or 0} recovered), {totals['bytes'] / 1e9:.2f} GB, "
+          f"{totals['ms'] / 3_600_000:.1f} h")
+    if totals["first"] is not None:
+        print(f"Covering        : {local(totals['first']):%Y-%m-%d %H:%M} to {local(totals['last']):%Y-%m-%d %H:%M} "
+              f"(local time)")
+    print(f"Motion events   : {events_total}")
 
-    print(f"Sensitivity {motion.sensitivity} (pixel threshold {analyzer.threshold}), "
-          f"min area {motion.min_area_percent:g}%, trigger {motion.trigger_frames} frames, "
-          f"cooldown {motion.cooldown_seconds:g} s, {motion.analysis_fps:g} frames/s. "
-          f"Running {args.seconds} s; Ctrl+C stops.\n")
-    quiet_scores: list[float] = []
-    processing: list[float] = []
-    picam2 = camera.picam2
-    try:
-        picam2.start()
-        stream = picam2.stream_configuration("lores")
-        width, height = stream["size"]
-        stride = stream["stride"]
-        step = max(1, width // ANALYSIS_WIDTH)
-        interval = 1.0 / motion.analysis_fps
-        end_at = time.monotonic() + args.seconds
-        next_print = next_save = time.monotonic()
-        second_max = 0.0
-        while time.monotonic() < end_at:
-            loop_start = time.monotonic()
-            buffer = picam2.capture_buffer("lores", wait=2.0)
-            now = time.time()
-            gray = np.ascontiguousarray(buffer[: stride * height].reshape(height, stride)[::step, :width:step])
-            t0 = time.perf_counter()
-            score = analyzer.analyze(gray, now)
-            tracker.update(score.moving, score.largest_percent, now)
-            processing.append((time.perf_counter() - t0) * 1000)
-            second_max = max(second_max, score.largest_percent)
-            if tracker.current is None and not score.moving:
-                quiet_scores.append(score.largest_percent)
+    day = date.fromisoformat(args.date) if args.date else datetime.now().astimezone().date()
+    day_start = datetime.combine(day, dtime.min).astimezone()
+    start_ms = int(day_start.timestamp() * 1000)
+    end_ms = int((day_start + timedelta(days=1)).timestamp() * 1000)
 
-            if loop_start >= next_print:
-                state = "MOTION" if tracker.current else ("moving" if score.moving else "quiet")
-                light = "  (lighting change ignored)" if score.lighting_change else ""
-                print(f"{time.strftime('%H:%M:%S')}  largest {second_max:5.2f}%  "
-                      f"[{bar(second_max, motion.min_area_percent * 4)}]  {state}{light}", flush=True)
-                second_max = 0.0
-                next_print = loop_start + 1.0
-            if args.save_every and analyzer.last_mask is not None and loop_start >= next_save:
-                side = np.hstack([gray, analyzer.last_mask])
-                path = SNAPSHOT_DIR / f"{time.strftime('%H%M%S')}_motion.png"
-                cv2.imwrite(str(path), side)
-                next_save = loop_start + args.save_every
-            delay = interval - (time.monotonic() - loop_start)
-            if delay > 0:
-                time.sleep(delay)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        tracker.flush()
-        camera.close()
+    recordings = conn.execute(
+        "SELECT * FROM recordings WHERE start_utc < ? AND COALESCE(end_utc, start_utc) >= ? ORDER BY start_utc",
+        (end_ms, start_ms)).fetchall()
+    events = conn.execute(
+        "SELECT * FROM motion_events WHERE start_utc >= ? AND start_utc < ? ORDER BY start_utc",
+        (start_ms, end_ms)).fetchall()
 
-    noise = percentile(quiet_scores, 99)
-    print("\n=== Summary ===")
-    print(f"Frames analysed      : {len(processing)}, average {np.mean(processing) if processing else 0:.1f} ms "
-          f"per frame (max {max(processing) if processing else 0:.1f} ms)")
-    print(f"Events               : {len(events)}")
-    print(f"Quiet-scene noise    : 99% of quiet frames had a largest region below {noise:.2f}%")
-    if noise and motion.min_area_percent < 2 * noise:
-        print(f"Advice               : min_area_percent {motion.min_area_percent:g} is close to the noise level; "
-              f"try {max(2 * noise, 0.1):.2f} or a lower sensitivity")
-    else:
-        print(f"Advice               : min_area_percent {motion.min_area_percent:g} is comfortably above the noise")
-    if args.save_every:
-        print(f"Debug images         : {SNAPSHOT_DIR}")
-    return 0
+    slot_ms = (end_ms - start_ms) // TIMELINE_SLOTS
+    line = ["·"] * TIMELINE_SLOTS
+    for r in recordings:
+        first = max(0, (r["start_utc"] - start_ms) // slot_ms)
+        last = min(TIMELINE_SLOTS - 1, ((r["end_utc"] or r["start_utc"]) - start_ms) // slot_ms)
+        for i in range(first, last + 1):
+            if line[i] == "·":
+                line[i] = "─"
+    for e in events:
+        line[min(TIMELINE_SLOTS - 1, (e["start_utc"] - start_ms) // slot_ms)] = "█"
+
+    print(f"\n{day:%d %B %Y} (local time)   ─ recording   █ motion   · nothing recorded")
+    print(f"00:00 {''.join(line)} 24:00")
+
+    print(f"\nMotion events ({len(events)}):")
+    for e in events:
+        files = [row["rel_path"] for row in conn.execute(
+            "SELECT r.rel_path FROM motion_event_recordings l JOIN recordings r ON r.id = l.recording_id"
+            " WHERE l.event_id = ? ORDER BY r.start_utc", (e["id"],))]
+        ongoing = " (ongoing)" if e["end_utc"] is None else ""
+        print(f"  {local(e['start_utc']):%H:%M:%S}  Motion detected  {fmt_duration(e['duration_ms'])}{ongoing}, "
+              f"peak {e['peak_area_pct'] or 0:.1f}%  ->  {', '.join(files) or 'footage deleted / not yet indexed'}")
+
+    shown = [r for r in recordings if r["has_motion"] or not args.motion_only]
+    print(f"\nRecordings ({len(shown)}{' with motion' if args.motion_only else ''}):")
+    for r in shown:
+        flags = ("  motion" if r["has_motion"] else "") + ("  recovered" if r["status"] == "recovered" else "") \
+            + ("  clock-not-synced" if r["clock_synced"] == 0 else "")
+        end = local(r["end_utc"])
+        print(f"  {local(r['start_utc']):%H:%M:%S} - {end:%H:%M:%S}  {fmt_duration(r['duration_ms']):>8}  "
+              f"{r['size_bytes'] / 1e6:6.1f} MB  {r['rel_path']}{flags}" if end else f"  {r['rel_path']}")
+    return 0 if check == "ok" else 1
 
 
 if __name__ == "__main__":
@@ -562,111 +645,97 @@ EOF
 
 ## Test procedure
 
-Run everything as `ysak` from `~/surveillance`.
+Run everything as `ysak` from `~/surveillance`. You'll need two SSH windows for steps 2 and 4.
 
-**0. Finish Phase 5: the real critical-storage test, then restore the normal settings.**
+**1. First start.** Use 60-second segments for testing:
 
 ```bash
-python3 tools/set_setting.py storage.min_free_gb 120
+python3 tools/set_setting.py recording.segment_seconds 60
 python3 -m app.main
 ```
 
-Within about 2 s of starting, it should log `Storage critical … PAUSED` and then `Recording paused: storage is critically full`, and no `Segment completed` lines should follow. Leave it for about 30 s, then press Ctrl+C.
+The first lines should include `Database ready`, `Index reconciled … N added` (your existing test recordings get indexed) and `Database backup written`.
 
-Then restore the normal settings. Keep 60-second segments for the rest of this phase:
+**2. Record for about 5 minutes and walk past twice.** Try to have one walk-through **span a minute boundary**, for example from :50 to :10 on the clock. While it runs, look at the report from the second window:
 
 ```bash
-python3 tools/set_setting.py storage.min_free_gb 2
-python3 tools/set_setting.py storage.max_storage_gb 45
-python3 tools/set_setting.py motion.sensitivity 70      # also writes the new motion section into the file
+python3 tools/phase7_db_report.py
 ```
 
-**1. Tune on your real scene.** The recorder must be stopped for this. Run the tool for 60 s: stay out of view for the first 20 s, walk through the view at about 25 s, then leave again.
+Then stop the recorder with Ctrl+C and run the report again.
+
+**3. Optional: look inside with SQL.**
 
 ```bash
-python3 tools/phase6_motion_tune.py --seconds 60 --save-every 5
+sqlite3 -readonly database/surveillance.db \
+  "SELECT id, datetime(start_utc/1000,'unixepoch','localtime'), duration_ms/1000.0, recording_file FROM v_motion_events;"
 ```
 
-**2. Look at the debug images on your laptop** (run this on the laptop). In each image, the left half is what the detector sees and the right half is the changed pixels. You should see only yourself in white, not flickering noise.
+**4. Crash during motion.** Start the recorder, walk in front of the camera, and **while you're still moving** kill it from the second window:
 
 ```bash
-scp 'ysak@ysak.local:~/surveillance/snapshots/phase6/*.png' .
+pkill -9 -f "^python3 -m app.main"
 ```
 
-**3. Test room-light changes.** Rerun the tool for 30 s and switch the room light off and on. Expect `(lighting change ignored)`, not `MOTION STARTED`. With your camera's slow auto-exposure, this may show up as a short event instead. Tell me if it does.
+Start it again. Expect `Closed 1 motion event(s) left open by a crash or power cut`, then within about 60–90 s a `Recovered unfinished segment …` line. Stop it, and the report should show that segment marked `recovered`.
 
-**4. Run with the recorder** for about 4 minutes, walking through the view once around the middle:
+**5. Database corruption.** Stop the recorder, deliberately damage the database, and start again:
 
 ```bash
+dd if=/dev/urandom of=database/surveillance.db bs=1 seek=100 count=4000 conv=notrunc
 python3 -m app.main
 ```
 
-**5. Measure CPU while it records** (in a second window):
+Expect `Database failed its integrity check; moved aside …`, then `Restored the database from backup …`, then `Index reconciled …`. Stop it and run the report: it should say `integrity: ok` and list the recordings again. Motion events recorded after the backup are lost, which is expected; the recordings themselves are never lost.
+
+**6. CPU over 60 seconds.** With the recorder running, run this in the second window and wait 60 s. The second line is the 60-second average:
 
 ```bash
-top -b -n 3 -d 5 -p "$(pgrep -f '^python3 -m app.main')" | grep python3
+top -b -n 2 -d 60 -p "$(pgrep -f '^python3 -m app.main')" | grep python3
+```
+
+**7. Go back to 5-minute segments:**
+
+```bash
+python3 tools/set_setting.py recording.segment_seconds 300
 ```
 
 ## Expected output
 
-The tuning tool (step 1) should look roughly like this:
+The report should look roughly like this:
 
 ```text
-Sensitivity 70 (pixel threshold 28), min area 0.5%, trigger 3 frames, cooldown 10 s, 5 frames/s. Running 60 s; Ctrl+C stops.
+Database        : /home/ysak/surveillance/database/surveillance.db  (integrity: ok)
+Recordings      : 9 (3 with motion, 0 recovered), 0.07 GB, 0.1 h
+Covering        : 2026-09-24 00:29 to 2026-09-24 00:52 (local time)
+Motion events   : 3
 
-22:10:01  largest  0.00%  [..............................]  quiet
-...
-22:10:25  largest  6.84%  [##############################]  moving
-  >>> MOTION STARTED (area 4.1%)
-22:10:26  largest 11.20%  [##############################]  MOTION
-...
-  <<< motion ended after 8.4 s (peak 14.9%)
+24 September 2026 (local time)   ─ recording   █ motion   · nothing recorded
+00:00 █····································· 24:00
 
-=== Summary ===
-Frames analysed      : 300, average 3.0 ms per frame (max 8.0 ms)
-Events               : 1
-Quiet-scene noise    : 99% of quiet frames had a largest region below 0.05%
-Advice               : min_area_percent 0.5 is comfortably above the noise
+Motion events (3):
+  00:47:52  Motion detected  18.4 s, peak 11.2%  ->  2026-09-23/16-47-00Z.mp4, 2026-09-23/16-48-00Z.mp4
+  ...
+
+Recordings (9):
+  00:47:00 - 00:48:00    60.0 s     9.4 MB  2026-09-23/16-47-00Z.mp4  motion
+  00:48:00 - 00:49:00    60.0 s     9.4 MB  2026-09-23/16-48-00Z.mp4  motion
 ```
 
-The recorder (step 4) should look roughly like this:
-
-```text
-INFO Recorder: Started recording to ... (60 s segments, 2.50 Mbit/s, keyframe every 2 s)
-INFO MotionDetector: Motion detection on: sensitivity 70 (pixel threshold 28), min area 0.50%, cooldown 10 s, 5 analysed frames/s
-INFO Recorder: Segment completed: 2026-09-24/00-11-00Z.mp4 ... size=9.4MB motion=no
-INFO MotionDetector: Motion started (area 3.9% of the frame)
-INFO MotionDetector: Motion ended after 9.2 s (peak area 15.3%)
-INFO Recorder: Segment completed: 2026-09-24/00-12-00Z.mp4 ... size=9.6MB motion=yes
-```
-
-For CPU, I expect roughly 12–15 % of one core, about the same as Phase 3. The detector itself should add only about 2 %.
-
-## Tuning guide
-
-| Problem | Change |
-|---|---|
-| Events with nobody there (noise, flicker) | Lower the sensitivity (e.g. 55), or raise `min_area_percent` above twice the "quiet-scene noise" figure |
-| A small or distant person is missed | Raise the sensitivity (e.g. 80) or lower `min_area_percent` (e.g. 0.2) |
-| One walk-through is split into several events | Raise `cooldown_seconds` (e.g. 20) |
-| A short blip starts an event | Raise `trigger_frames` (e.g. 5) |
-| Lots of events at night | Expected with this sensor: it has no infrared, so the image is mostly noise in the dark. Use a lower night sensitivity, or add an IR light (Phase 14 performance guide) |
-
-For example: `python3 tools/set_setting.py motion.sensitivity 55`. You can also try values temporarily with the tool first: `--sensitivity 55 --min-area 1.0`.
+The walk that crossed a minute boundary should be listed with **two** files. Filenames stay in UTC (a day behind your local date around midnight), and the report shows local time.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `ABORTED, nothing changed` from the update script | One of your files differs from what I sent. Send me the message and I'll give you full files. |
-| `Motion detection disabled: OpenCV is not installed` | `sudo apt install -y python3-opencv` |
-| The tuning tool says the camera is in use | Stop the recorder first (Ctrl+C in its window). |
-| Frame gaps return in the Phase 4 checker | Send me the checker output. OpenCV is loaded before recording starts, so this shouldn't happen. |
+| `ABORTED, nothing changed` from the update script | Send me the message. |
+| `Cannot open the database; recording continues without an index` | Send me the log lines that follow it. Recording is unaffected. |
+| The report says `No database yet` | Run `python3 -m app.main` once from `~/surveillance`. |
+| `sqlite3: command not found` | `sudo apt install -y sqlite3` (only needed for step 3) |
 
 **Please send me:**
-- the result of step 0 (the critical pause);
-- the tuning tool's summary from steps 1 and 3;
-- the recorder's log from step 4, showing the motion lines and `motion=yes/no`;
-- the CPU figure from step 5.
+- the report from step 2 (showing the event that spans two files);
+- the log lines from steps 4 and 5;
+- the 60-second CPU figure from step 6.
 
-Phase 7 then stores recordings and motion events in SQLite, the index the web interface will use.
+Phase 8 is the local web dashboard: live status, the event timeline, and browsing recordings. It will listen only on the Pi itself until the login system (Phase 11) and private remote access (Phase 12) are in place.
